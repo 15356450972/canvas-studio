@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { BookOpen, Bot, Download, Home, Images, Menu, PanelLeftClose, PanelLeftOpen, Plus, Redo2, Trash2, Undo2, Upload } from "lucide-react";
+import { BookOpen, Bot, ChevronDown, Download, Home, Images, LayoutGrid, Loader2, Menu, PanelLeftClose, PanelLeftOpen, Plus, Redo2, Trash2, Undo2, Upload } from "lucide-react";
 import { Button, Dropdown, Modal, Tooltip } from "antd";
 import { useTranslation } from "react-i18next";
 
@@ -24,10 +24,16 @@ export function CanvasTopBar({
     onCreateProject,
     onDeleteProject,
     onExportProject,
+    videoCount,
+    selectedVideoCount,
+    exportingVideos,
+    onExportVideos,
     onImportImage,
     onOpenPlugins,
     onUndo,
     onRedo,
+    canArrange,
+    onArrange,
     agentOpen,
     compactAgentStatus,
     onToggleAgent,
@@ -46,10 +52,16 @@ export function CanvasTopBar({
     onCreateProject: () => void;
     onDeleteProject: () => void;
     onExportProject: () => void;
+    videoCount: number;
+    selectedVideoCount: number;
+    exportingVideos: boolean;
+    onExportVideos: (selectedOnly: boolean) => void;
     onImportImage: () => void;
     onOpenPlugins: () => void;
     onUndo: () => void;
     onRedo: () => void;
+    canArrange: boolean;
+    onArrange: () => void;
     agentOpen: boolean;
     compactAgentStatus: { connected: boolean; enabled: boolean; activity: string };
     onToggleAgent: () => void;
@@ -139,6 +151,27 @@ export function CanvasTopBar({
                 </div>
 
                 <div className="pointer-events-auto flex items-center gap-1.5">
+                    <Dropdown
+                        trigger={["click"]}
+                        placement="bottomRight"
+                        disabled={!videoCount || exportingVideos}
+                        menu={{ items: [
+                            { key: "all-videos", label: t("canvas.export.allVideos", { count: videoCount }), onClick: () => onExportVideos(false) },
+                            { key: "selected-videos", disabled: !selectedVideoCount, label: t("canvas.export.selectedVideos", { count: selectedVideoCount }), onClick: () => onExportVideos(true) },
+                        ] }}
+                    >
+                        <button type="button" disabled={!videoCount || exportingVideos} aria-label={t("canvas.export.videos")} aria-busy={exportingVideos} title={t("canvas.export.videosHint")} className="flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2 text-sm transition hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-35 dark:hover:bg-white/10" style={{ color: theme.node.text }}>
+                            {exportingVideos ? <Loader2 className="size-4 animate-spin" /> : <Download className="size-4" />}
+                            <span>{t("canvas.export.videos")}</span>
+                            <ChevronDown className="size-3.5 opacity-50" />
+                        </button>
+                    </Dropdown>
+                    <Tooltip title={t("canvas.layout.hint")}>
+                        <button type="button" disabled={!canArrange} onClick={onArrange} aria-label={t("canvas.layout.arrange")} className="flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2 text-sm transition hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-35 dark:hover:bg-white/10" style={{ color: theme.node.text }}>
+                            <LayoutGrid className="size-4" />
+                            <span>{t("canvas.layout.arrange")}</span>
+                        </button>
+                    </Tooltip>
                     <UserStatusActions variant="canvas" onOpenShortcuts={() => setShortcutsOpen(true)} onOpenPlugins={onOpenPlugins} />
                     <span className="h-6 w-px" style={{ background: theme.toolbar.border }} />
                     <Button

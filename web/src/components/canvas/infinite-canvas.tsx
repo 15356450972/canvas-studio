@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { startTransition, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { canvasThemes, type CanvasBackgroundMode } from "@/lib/canvas-theme";
 import { useThemeStore } from "@/stores/use-theme-store";
@@ -29,23 +29,35 @@ export function InfiniteCanvas({ containerRef, viewport, tool, backgroundMode = 
         hasMoved: false,
         startedOnBackground: false,
     });
-    const scaleRef = useRef(viewport.k);
-    const frameRef = useRef<number | null>(null);
-    const nextViewportRef = useRef<ViewportTransform | null>(null);
+    const liveViewportRef = useRef(viewport);
+    const emittedViewportsRef = useRef(new WeakSet<ViewportTransform>());
+    const layerRef = useRef<HTMLDivElement>(null);
+    const gridRef = useRef<HTMLDivElement>(null);
     const [isSpacePressed, setIsSpacePressed] = useState(false);
     const [isControlPressed, setIsControlPressed] = useState(false);
     const [isPanning, setIsPanning] = useState(false);
 
-    useEffect(() => {
-        scaleRef.current = viewport.k;
-    }, [viewport.k]);
+    // 平移/缩放时直接写 DOM transform，React 状态用 transition 低优先级提交，避免每帧同步重渲染整个画布页面。
+    const applyViewport = (next: ViewportTransform) => {
+        liveViewportRef.current = next;
+        if (layerRef.current) layerRef.current.style.transform = `translate(${next.x}px, ${next.y}px) scale(${next.k})`;
+        if (gridRef.current) {
+            const gridSize = 48 * next.k;
+            gridRef.current.style.backgroundSize = `${gridSize}px ${gridSize}px`;
+            gridRef.current.style.backgroundPosition = `${next.x % gridSize}px ${next.y % gridSize}px`;
+        }
+    };
 
-    useEffect(
-        () => () => {
-            if (frameRef.current) cancelAnimationFrame(frameRef.current);
-        },
-        [],
-    );
+    const emitViewport = (next: ViewportTransform) => {
+        applyViewport(next);
+        emittedViewportsRef.current.add(next);
+        startTransition(() => onViewportChange(next));
+    };
+
+    // 外部设置的视口（加载、聚焦、缩放按钮、小地图）直接应用；自己发出的旧视口晚提交时保持最新的实时视口。
+    useLayoutEffect(() => {
+        applyViewport(emittedViewportsRef.current.has(viewport) ? liveViewportRef.current : viewport);
+    }, [viewport, backgroundMode]);
 
     useEffect(() => {
         const handleKeyDown = (event: KeyboardEvent) => {
@@ -88,18 +100,19 @@ export function InfiniteCanvas({ containerRef, viewport, tool, backgroundMode = 
         const target = event.target instanceof Element ? event.target : null;
         if (target?.closest("[data-canvas-no-zoom],.ant-modal,.ant-popover,.ant-dropdown,.ant-select-dropdown,.ant-picker-dropdown")) return;
 
+        const current = liveViewportRef.current;
         const delta = -event.deltaY;
         const factor = Math.pow(1.1, delta / 100);
-        const newScale = Math.min(Math.max(viewport.k * factor, 0.05), 5);
+        const newScale = Math.min(Math.max(current.k * factor, 0.05), 5);
         const rect = containerRef.current?.getBoundingClientRect();
         if (!rect) return;
 
         const mouseX = event.clientX - rect.left;
         const mouseY = event.clientY - rect.top;
-        const worldX = (mouseX - viewport.x) / viewport.k;
-        const worldY = (mouseY - viewport.y) / viewport.k;
+        const worldX = (mouseX - current.x) / current.k;
+        const worldY = (mouseY - current.y) / current.k;
 
-        onViewportChange({
+        emitViewport({
             x: mouseX - worldX * newScale,
             y: mouseY - worldY * newScale,
             k: newScale,
@@ -122,8 +135,8 @@ export function InfiniteCanvas({ containerRef, viewport, tool, backgroundMode = 
                 isPanning: true,
                 startX: event.clientX,
                 startY: event.clientY,
-                initialX: viewport.x,
-                initialY: viewport.y,
+                initialX: liveViewportRef.current.x,
+                initialY: liveViewportRef.current.y,
                 hasMoved: false,
                 startedOnBackground: isBackgroundClick,
             };
@@ -155,15 +168,10 @@ export function InfiniteCanvas({ containerRef, viewport, tool, backgroundMode = 
                 panState.current.hasMoved = true;
             }
 
-            nextViewportRef.current = {
+            emitViewport({
                 x: panState.current.initialX + dx,
                 y: panState.current.initialY + dy,
-                k: scaleRef.current,
-            };
-            if (frameRef.current) return;
-            frameRef.current = requestAnimationFrame(() => {
-                frameRef.current = null;
-                if (nextViewportRef.current) onViewportChange(nextViewportRef.current);
+                k: liveViewportRef.current.k,
             });
         };
 
@@ -206,6 +214,9 @@ export function InfiniteCanvas({ containerRef, viewport, tool, backgroundMode = 
     const temporaryTool = isControlPressed || isSpacePressed;
     const activeTool = temporaryTool ? (tool === "select" ? "pan" : "select") : tool;
     const cursor = isPanning ? "grabbing" : activeTool === "pan" ? "grab" : undefined;
+    const dotSize = viewport.k < 0.12 ? 0.8 : 1.15;
+    const gridBackgroundImage =
+        backgroundMode === "dots" ? `radial-gradient(circle, ${theme.canvas.dot} ${dotSize}px, transparent ${dotSize + 0.2}px)` : `linear-gradient(${theme.canvas.line} 1px, transparent 1px), linear-gradient(90deg, ${theme.canvas.line} 1px, transparent 1px)`;
 
     return (
         <div
@@ -219,38 +230,11 @@ export function InfiniteCanvas({ containerRef, viewport, tool, backgroundMode = 
             onDragOver={(event) => event.preventDefault()}
             onDrop={onDrop}
         >
-            <CanvasGrid viewport={viewport} mode={backgroundMode} />
-            <div
-                className="absolute origin-top-left"
-                style={{
-                    transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.k})`,
-                }}
-            >
+            {backgroundMode === "blank" ? null : <div ref={gridRef} className="pointer-events-none absolute inset-0 opacity-40" style={{ backgroundImage: gridBackgroundImage }} />}
+            {/* transform / backgroundSize / backgroundPosition 由 applyViewport 直接写入 DOM，不放进 JSX，避免过期的 React 提交覆盖实时视口。 */}
+            <div ref={layerRef} className="absolute origin-top-left">
                 {children}
             </div>
         </div>
-    );
-}
-
-function CanvasGrid({ viewport, mode }: { viewport: ViewportTransform; mode: CanvasBackgroundMode }) {
-    const theme = canvasThemes[useThemeStore((state) => state.theme)];
-    if (mode === "blank") return null;
-
-    const gridSize = 48 * viewport.k;
-    const x = viewport.x % gridSize;
-    const y = viewport.y % gridSize;
-    const dotSize = viewport.k < 0.12 ? 0.8 : 1.15;
-    const backgroundImage =
-        mode === "dots" ? `radial-gradient(circle, ${theme.canvas.dot} ${dotSize}px, transparent ${dotSize + 0.2}px)` : `linear-gradient(${theme.canvas.line} 1px, transparent 1px), linear-gradient(90deg, ${theme.canvas.line} 1px, transparent 1px)`;
-
-    return (
-        <div
-            className="pointer-events-none absolute inset-0 opacity-40"
-            style={{
-                backgroundImage,
-                backgroundSize: `${gridSize}px ${gridSize}px`,
-                backgroundPosition: `${x}px ${y}px`,
-            }}
-        />
     );
 }

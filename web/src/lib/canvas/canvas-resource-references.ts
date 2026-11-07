@@ -16,6 +16,8 @@ export type CanvasResourceReference = {
     previewUrl?: string;
     text?: string;
     active: boolean;
+    token?: string;
+    connected?: boolean;
 };
 
 export function buildNodeMentionReferences(node: CanvasNodeData, nodes: CanvasNodeData[], connections: CanvasConnection[]) {
@@ -24,6 +26,31 @@ export function buildNodeMentionReferences(node: CanvasNodeData, nodes: CanvasNo
 
 export function buildCanvasResourceReferences(nodes: CanvasNodeData[]) {
     return labelResourceNodes(nodes, true);
+}
+
+/** Resolve @names in a complete prompt; ambiguous names stay editable until explicitly selected. */
+export function resolveCanvasPromptMentions(prompt: string, references: CanvasResourceReference[], options: { keepAmbiguous?: boolean } = {}) {
+    const byName = new Map<string, CanvasResourceReference[]>();
+    references.forEach((reference) => {
+        const name = reference.title.trim();
+        if (name) byName.set(name, [...(byName.get(name) || []), reference]);
+    });
+    const names = [...byName.keys()].sort((a, b) => b.length - a.length);
+    const nodeIds = new Set<string>();
+    const ambiguousNames = new Set<string>();
+    if (!names.length) return { prompt, nodeIds, ambiguousNames };
+    const pattern = new RegExp(`@(${names.map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`, "g");
+    const resolved = prompt.replace(pattern, (_token, name: string) => {
+        const matches = byName.get(name)!;
+        if (matches.length > 1) {
+            if (!options.keepAmbiguous) throw new Error(i18n.t("canvas.references.ambiguous", { name }));
+            ambiguousNames.add(name);
+            return _token;
+        }
+        nodeIds.add(matches[0].nodeId);
+        return `@[node:${matches[0].nodeId}]`;
+    });
+    return { prompt: resolved, nodeIds, ambiguousNames };
 }
 
 export async function resolveCanvasReferenceImages(references: CanvasResourceReference[], nodes: CanvasNodeData[]) {

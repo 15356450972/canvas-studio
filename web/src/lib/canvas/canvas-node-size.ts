@@ -1,4 +1,13 @@
-export function fitNodeSize(width: number, height: number, maxWidth = 640, maxHeight = 640) {
+export const MEDIA_NODE_DISPLAY_EDGE = 640;
+
+export function videoNodeSize(width: number, height: number, edge = MEDIA_NODE_DISPLAY_EDGE) {
+    const w = Math.max(1, width);
+    const h = Math.max(1, height);
+    const scale = edge / Math.max(w, h);
+    return { width: w * scale, height: h * scale };
+}
+
+export function fitNodeSize(width: number, height: number, maxWidth = MEDIA_NODE_DISPLAY_EDGE, maxHeight = MEDIA_NODE_DISPLAY_EDGE) {
     const w = Math.max(1, width);
     const h = Math.max(1, height);
     const scale = Math.min(1, maxWidth / w, maxHeight / h);

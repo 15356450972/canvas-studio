@@ -6,6 +6,7 @@ import { fetchableMediaUrl } from "@/lib/media-url";
 export type UploadedFile = { url: string; storageKey: string; bytes: number; mimeType: string; width?: number; height?: number; durationMs?: number };
 
 const store = localforage.createInstance({ name: "infinite-canvas", storeName: "media_files" });
+const videoLogStore = localforage.createInstance({ name: "infinite-canvas", storeName: "video_generation_logs" });
 const objectUrls = new Map<string, string>();
 
 export async function uploadMediaFile(input: string | Blob, prefix = "file"): Promise<UploadedFile> {
@@ -53,6 +54,10 @@ export async function deleteStoredMedia(keys: Iterable<string>) {
 
 export async function cleanupUnusedMedia(usedData: unknown) {
     const usedKeys = collectMediaStorageKeys(usedData);
+    // 视频创作台的生成记录、参考视频和参考音频同样占用本地视频文件，不能当垃圾清掉。
+    await videoLogStore.iterate((value) => {
+        collectMediaStorageKeys(value, usedKeys);
+    });
     const unused: string[] = [];
     await store.iterate((_value, key) => {
         if (!usedKeys.has(key)) unused.push(key);

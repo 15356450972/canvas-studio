@@ -1,20 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent, MouseEvent, PointerEvent } from "react";
 import { createPortal } from "react-dom";
-import { Image } from "antd";
+import { App, Image } from "antd";
 import { FileText, Image as ImageIcon, Music2, Video } from "lucide-react";
 
 import i18n from "@/i18n";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { isImeComposing, isPlainEnterKey } from "@/lib/keyboard-event";
 import { useThemeStore } from "@/stores/use-theme-store";
-import type { CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
+import { resolveCanvasPromptMentions, type CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
 
 type Props = {
     value: string;
     references: CanvasResourceReference[];
     onChange: (value: string) => void;
     onSubmit?: () => void;
+    onReferenceSelect?: (reference: CanvasResourceReference) => void;
     className?: string;
     style?: CSSProperties;
     placeholder?: string;
@@ -30,8 +31,9 @@ type Token =
     | { type: "reference"; label: string };
 
 // Prompt-panel contentEditable input: @ references embed thumbnail chips instead of plain label text.
-// Serialization converts chips back to reference labels so the generated value matches the former textarea semantics.
-export function CanvasPromptChipInput({ value, references, onChange, onSubmit, className, style, placeholder }: Props) {
+// Serialize new references as stable node tokens; generation resolves them to ordered media labels.
+export function CanvasPromptChipInput({ value, references, onChange, onSubmit, onReferenceSelect, className, style, placeholder }: Props) {
+    const { message } = App.useApp();
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const editorRef = useRef<HTMLDivElement>(null);
     const composingRef = useRef(false);
@@ -43,9 +45,16 @@ export function CanvasPromptChipInput({ value, references, onChange, onSubmit, c
     const [imagePreview, setImagePreview] = useState<string | null>(null);
 
     const activeReferences = useMemo(() => references.filter((item) => item.active), [references]);
-    const referenceByLabel = useMemo(() => new Map(activeReferences.map((item) => [item.label, item])), [activeReferences]);
+    const referenceByLabel = useMemo(() => {
+        const map = new Map<string, CanvasResourceReference>();
+        activeReferences.forEach((item) => {
+            map.set(item.token || item.label, item);
+            if (item.token && item.connected) map.set(item.label, { ...item, token: undefined });
+        });
+        return map;
+    }, [activeReferences]);
     // Match longer labels first so a shorter label cannot split a longer one.
-    const activeLabels = useMemo(() => Array.from(new Set(activeReferences.map((item) => item.label))).sort((a, b) => b.length - a.length), [activeReferences]);
+    const activeLabels = useMemo(() => [...referenceByLabel.keys()].sort((a, b) => b.length - a.length), [referenceByLabel]);
     const tokens = useMemo(() => parseTokens(value, activeLabels), [value, activeLabels]);
 
     const candidates = useMemo(() => {
@@ -76,6 +85,13 @@ export function CanvasPromptChipInput({ value, references, onChange, onSubmit, c
     const emit = (next: string) => {
         lastEmittedRef.current = next;
         onChange(next);
+    };
+
+    const resolveMentions = (text: string, notify = true) => {
+        const resolved = resolveCanvasPromptMentions(text, activeReferences, { keepAmbiguous: true });
+        if (notify && resolved.ambiguousNames.size) message.warning(i18n.t("canvas.references.pasteAmbiguous", { names: [...resolved.ambiguousNames].join("、") }));
+        if (notify && !resolved.nodeIds.size && !resolved.ambiguousNames.size && /(^|[\s：:，,。；;])@(?!\[node:)\S/.test(text)) message.warning(i18n.t("canvas.references.pasteUnmatched"));
+        return resolved.prompt;
     };
 
     const syncFromEditor = () => {
@@ -121,6 +137,7 @@ export function CanvasPromptChipInput({ value, references, onChange, onSubmit, c
             placeCaretAtEnd(editor);
         }
         closeMention();
+        onReferenceSelect?.(reference);
         emit(serializeEditor(editor));
     };
 
@@ -141,6 +158,35 @@ export function CanvasPromptChipInput({ value, references, onChange, onSubmit, c
                 aria-multiline="true"
                 className={`${className || ""} overflow-y-auto whitespace-pre-wrap break-words outline-none`}
                 style={{ ...style, cursor: "text" }}
+                onPaste={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    const editor = editorRef.current;
+                    const text = event.clipboardData.getData("text/plain").replace(/\r\n?/g, "\n");
+                    if (!editor || !text) return;
+                    const fragment = document.createDocumentFragment();
+                    parseTokens(resolveMentions(text), activeLabels).forEach((token) => {
+                        const reference = token.type === "reference" ? referenceByLabel.get(token.label) : undefined;
+                        fragment.append(reference ? createReferenceChip(reference, theme, setImagePreview) : document.createTextNode(token.type === "text" ? token.value : token.label));
+                    });
+                    const last = fragment.lastChild;
+                    if (!last) return;
+                    const selection = window.getSelection();
+                    let range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+                    if (!range || !editor.contains(range.commonAncestorContainer)) {
+                        range = document.createRange();
+                        range.selectNodeContents(editor);
+                        range.collapse(false);
+                    }
+                    range.deleteContents();
+                    range.insertNode(fragment);
+                    range.setStartAfter(last);
+                    range.collapse(true);
+                    selection?.removeAllRanges();
+                    selection?.addRange(range);
+                    closeMention();
+                    emit(serializeEditor(editor));
+                }}
                 onInput={() => {
                     if (!composingRef.current) syncFromEditor();
                 }}
@@ -188,7 +234,14 @@ export function CanvasPromptChipInput({ value, references, onChange, onSubmit, c
                     }
                     requestAnimationFrame(syncMention);
                 }}
-                onBlur={() => window.setTimeout(closeMention, 120)}
+                onBlur={() => {
+                    window.setTimeout(closeMention, 120);
+                    const editor = editorRef.current;
+                    if (!editor || composingRef.current) return;
+                    const text = serializeEditor(editor);
+                    const resolved = resolveMentions(text, false);
+                    if (resolved !== text) emit(resolved);
+                }}
             />
             {mention && candidates.length ? (
                 <MentionMenu rect={mention.rect} references={candidates} activeIndex={Math.min(activeIndex, candidates.length - 1)} theme={theme} onSelect={insertReference} />
@@ -251,8 +304,8 @@ function MentionMenu({ rect, references, activeIndex, theme, onSelect }: { rect:
                 >
                     <ReferencePreview reference={reference} />
                     <span className="min-w-0 flex-1">
-                        <span className="block font-medium">{reference.label}</span>
-                        <span className="block truncate opacity-65">{reference.text || reference.title}</span>
+                        <span className="block truncate font-medium">{reference.title}</span>
+                        <span className="block truncate opacity-65">{i18n.t(`agent.composer.mentions.kind.${reference.kind}`)} · {reference.connected ? i18n.t("canvas.references.connected") : i18n.t("canvas.references.connectOnMention")}</span>
                     </span>
                 </button>
             ))}
@@ -266,7 +319,7 @@ function ReferencePreview({ reference }: { reference: CanvasResourceReference })
     if (reference.kind === "video" && reference.previewUrl) return <video src={reference.previewUrl} className="size-9 rounded-md bg-black object-cover" muted preload="metadata" />;
     const Icon = reference.kind === "audio" ? Music2 : reference.kind === "video" ? Video : reference.kind === "image" ? ImageIcon : FileText;
     return (
-        <span className="grid size-9 shrink-0 place-items-center rounded-md bg-black/10">
+        <span className="grid size-9 shrink-0 place-items-center">
             <Icon className="size-4" />
         </span>
     );
@@ -275,14 +328,22 @@ function ReferencePreview({ reference }: { reference: CanvasResourceReference })
 function createReferenceChip(reference: CanvasResourceReference, theme: (typeof canvasThemes)[keyof typeof canvasThemes], onImagePreview: (url: string) => void) {
     const wrapper = document.createElement("span");
     wrapper.contentEditable = "false";
-    wrapper.dataset.refLabel = reference.label;
+    wrapper.dataset.refLabel = reference.token || reference.label;
+    wrapper.title = reference.title;
     if (reference.kind === "image" && reference.previewUrl) {
         const image = document.createElement("img");
         image.src = reference.previewUrl;
         image.alt = reference.title;
-        image.className = "size-6 rounded object-cover";
-        wrapper.className = "mx-px inline-flex size-6 items-center justify-center overflow-hidden rounded align-middle";
+        image.className = "size-6 shrink-0 rounded object-cover";
+        wrapper.className = reference.token ? "mx-px inline-flex h-6 max-w-40 items-center gap-1 overflow-hidden rounded border pr-1 align-middle" : "mx-px inline-flex size-6 items-center justify-center overflow-hidden rounded align-middle";
+        if (reference.token) wrapper.style.borderColor = theme.node.stroke;
         wrapper.appendChild(image);
+        if (reference.token) {
+            const name = document.createElement("span");
+            name.className = "truncate text-xs";
+            name.textContent = reference.title;
+            wrapper.appendChild(name);
+        }
         wrapper.addEventListener("click", (event) => {
             event.preventDefault();
             event.stopPropagation();
@@ -294,7 +355,7 @@ function createReferenceChip(reference: CanvasResourceReference, theme: (typeof 
         wrapper.title = reference.text || reference.title;
         const text = document.createElement("span");
         text.className = "block truncate";
-        text.textContent = reference.kind === "text" ? reference.text || reference.title : reference.label;
+        text.textContent = reference.token ? reference.title : reference.kind === "text" ? reference.text || reference.title : reference.label;
         wrapper.appendChild(text);
     }
     return wrapper;

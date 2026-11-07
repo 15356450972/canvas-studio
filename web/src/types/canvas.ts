@@ -86,7 +86,7 @@ export type CanvasNodeMetadata = {
     durationMs?: number;
     videoTaskId?: string;
     imageTaskId?: string;
-    videoTaskProvider?: "openai" | "gemini";
+    videoTaskProvider?: "openai" | "gemini" | "newtake";
     groupId?: string;
     interactive?: boolean; // Plugin node interaction/move state; see CanvasNodeDefinition.interactionToggle.
 };

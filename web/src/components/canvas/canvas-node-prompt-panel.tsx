@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ArrowUp, LoaderCircle, Maximize2, Square } from "lucide-react";
-import { Button, Modal, Tooltip } from "antd";
+import { App, Button, Modal, Tooltip } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { ModelPicker } from "@/components/model-picker";
@@ -14,7 +14,7 @@ import { CanvasPromptChipInput } from "./canvas-prompt-chip-input";
 import { CanvasVideoSettingsPopover } from "./canvas-video-settings-popover";
 import { CanvasTextSettingsPopover } from "./canvas-text-settings-popover";
 import { CanvasNodeType, type CanvasGenerationMode, type CanvasNodeData } from "@/types/canvas";
-import type { CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
+import { buildCanvasResourceReferences, resolveCanvasPromptMentions, type CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
 import { CanvasNodeReferenceBar } from "./canvas-node-reference-bar";
 
 export type CanvasNodeGenerationMode = CanvasGenerationMode;
@@ -29,14 +29,16 @@ type CanvasNodePromptPanelProps = {
     mentionReferences?: CanvasResourceReference[];
     nodes: CanvasNodeData[];
     connectedNodes?: CanvasNodeData[];
+    onConnectReference?: (fromNodeId: string, toNodeId: string) => void;
     onDisconnectReference?: (fromNodeId: string, toNodeId: string) => void;
     onStartReferenceSelection?: (nodeId: string) => void;
     onImageSettingsOpenChange?: (open: boolean) => void;
     modeOverride?: CanvasNodeGenerationMode; // Plugin nodes set their generation type through useBuiltinPanel.mode.
 };
 
-export function CanvasNodePromptPanel({ node, nodes, isRunning, onPromptChange, onConfigChange, onGenerate, onStop, mentionReferences = [], connectedNodes = [], onDisconnectReference, onStartReferenceSelection, onImageSettingsOpenChange, modeOverride }: CanvasNodePromptPanelProps) {
+export function CanvasNodePromptPanel({ node, nodes, isRunning, onPromptChange, onConfigChange, onGenerate, onStop, mentionReferences = [], connectedNodes = [], onConnectReference, onDisconnectReference, onStartReferenceSelection, onImageSettingsOpenChange, modeOverride }: CanvasNodePromptPanelProps) {
     const { t } = useTranslation();
+    const { message } = App.useApp();
     const globalConfig = useEffectiveConfig();
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
@@ -47,6 +49,15 @@ export function CanvasNodePromptPanel({ node, nodes, isRunning, onPromptChange, 
     const isEditingExistingContent = hasTextContent || hasImageContent;
     const [prompt, setPrompt] = useState(node.metadata?.composerContent ?? node.metadata?.prompt ?? "");
     const [expanded, setExpanded] = useState(false);
+    const availableReferences = useMemo(() => {
+        const connectedIds = new Set(mentionReferences.map((reference) => reference.nodeId));
+        const others = buildCanvasResourceReferences(nodes.filter((item) => item.id !== node.id && !connectedIds.has(item.id)));
+        return [...mentionReferences, ...others].filter((reference) => reference.nodeId !== node.id).map((reference) => ({
+            ...reference,
+            token: `@[node:${reference.nodeId}]`,
+            connected: connectedIds.has(reference.nodeId),
+        }));
+    }, [mentionReferences, node.id, nodes]);
 
     // Restore prompts only when switching nodes; preserve the current input after generation on the same node.
     useEffect(() => {
@@ -55,15 +66,33 @@ export function CanvasNodePromptPanel({ node, nodes, isRunning, onPromptChange, 
     }, [node.id]);
 
     const updatePrompt = (value: string) => {
+        const previousReferences = new Set([...prompt.matchAll(/@\[node:([^\]]+)\]/g)].map((match) => match[1]));
+        const nextReferences = new Set([...value.matchAll(/@\[node:([^\]]+)\]/g)].map((match) => match[1]));
+        previousReferences.forEach((id) => { if (!nextReferences.has(id)) onDisconnectReference?.(id, node.id); });
+        nextReferences.forEach((id) => { if (!previousReferences.has(id)) onConnectReference?.(id, node.id); });
         setPrompt(value);
         if (isEditingExistingContent) onConfigChange(node.id, { composerContent: value });
         else onPromptChange(node.id, value);
     };
 
+    const disconnectReference = (fromNodeId: string, toNodeId: string) => {
+        const source = nodes.find((item) => item.id === fromNodeId);
+        const removedIds = new Set([fromNodeId, ...(source?.type === CanvasNodeType.Group ? nodes.filter((item) => item.metadata?.groupId === fromNodeId).map((item) => item.id) : [])]);
+        updatePrompt(prompt.replace(/@\[node:([^\]]+)\]/g, (token, id: string) => removedIds.has(id) ? "" : token));
+        onDisconnectReference?.(fromNodeId, toNodeId);
+    };
+
     const submit = () => {
         const text = prompt.trim();
         if (!text || isRunning) return;
-        onGenerate(node.id, mode, text);
+        try {
+            const resolved = resolveCanvasPromptMentions(text, availableReferences);
+            resolved.nodeIds.forEach((id) => onConnectReference?.(id, node.id));
+            if (resolved.prompt !== text) updatePrompt(resolved.prompt);
+            onGenerate(node.id, mode, resolved.prompt);
+        } catch (error) {
+            message.error(error instanceof Error ? error.message : String(error));
+        }
     };
 
     const openExpandedEditor = () => {
@@ -79,10 +108,11 @@ export function CanvasNodePromptPanel({ node, nodes, isRunning, onPromptChange, 
             onPointerDown={(event) => event.stopPropagation()}
             onWheel={(event) => event.stopPropagation()}
         >
-            <CanvasNodeReferenceBar nodeId={node.id} nodes={nodes} connectedNodes={connectedNodes} onDisconnect={onDisconnectReference} onStartSelection={onStartReferenceSelection} />
+            <CanvasNodeReferenceBar nodeId={node.id} nodes={nodes} connectedNodes={connectedNodes} onDisconnect={disconnectReference} onStartSelection={onStartReferenceSelection} />
             <CanvasPromptChipInput
                 value={prompt}
-                references={mentionReferences}
+                references={availableReferences}
+                onReferenceSelect={(reference) => onConnectReference?.(reference.nodeId, node.id)}
                 onChange={updatePrompt}
                 onSubmit={submit}
                 className="thin-scrollbar h-40 w-full cursor-text resize-none rounded-xl px-3 py-2 text-sm leading-5 outline-none"
@@ -90,6 +120,7 @@ export function CanvasNodePromptPanel({ node, nodes, isRunning, onPromptChange, 
                 placeholder={t(`canvas.promptPanel.${mode === "image" && hasImageContent ? "editImage" : mode === "text" && hasTextContent ? "editText" : mode}`)}
             />
 
+            <p className="mt-1 px-3 text-[11px]" style={{ color: theme.node.placeholder }}>{t("canvas.references.mentionHint")}</p>
             <div className="mt-2 flex min-w-0 items-center justify-between gap-2">
                 <div className="flex min-w-0 items-center gap-2">
                     <Tooltip title={t("canvas.promptPanel.expandEditor")}>
@@ -148,10 +179,11 @@ export function CanvasNodePromptPanel({ node, nodes, isRunning, onPromptChange, 
             </div>
             <Modal title={t("canvas.promptPanel.editorTitle")} open={expanded} centered width={760} footer={null} onCancel={() => setExpanded(false)} destroyOnHidden>
                 <div data-canvas-no-zoom className="pt-2" onWheelCapture={(event) => event.stopPropagation()}>
-                    <CanvasNodeReferenceBar nodeId={node.id} nodes={nodes} connectedNodes={connectedNodes} onDisconnect={onDisconnectReference} onStartSelection={(nodeId) => { setExpanded(false); onStartReferenceSelection?.(nodeId); }} />
+                    <CanvasNodeReferenceBar nodeId={node.id} nodes={nodes} connectedNodes={connectedNodes} onDisconnect={disconnectReference} onStartSelection={(nodeId) => { setExpanded(false); onStartReferenceSelection?.(nodeId); }} />
                     <CanvasPromptChipInput
                         value={prompt}
-                        references={mentionReferences}
+                        references={availableReferences}
+                        onReferenceSelect={(reference) => onConnectReference?.(reference.nodeId, node.id)}
                         onChange={updatePrompt}
                         className="thin-scrollbar h-[52dvh] min-h-80 w-full cursor-text overflow-y-auto rounded-xl border p-4 text-[15px] leading-6 outline-none"
                         style={{ background: "transparent", borderColor: theme.toolbar.border, color: theme.node.text }}

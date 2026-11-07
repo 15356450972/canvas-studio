@@ -44,6 +44,11 @@ const uguuProxy = {
         changeOrigin: true,
         rewrite: (path: string) => path.replace(/^\/__uguu/, ""),
     },
+    "/__oiioii": {
+        target: "http://64.83.9.159:18481",
+        changeOrigin: true,
+        rewrite: (path: string) => path.replace(/^\/__oiioii/, ""),
+    },
 };
 
 function isAllowedTosHost(host: string) {

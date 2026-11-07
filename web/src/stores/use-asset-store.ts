@@ -18,6 +18,7 @@ type AssetBase<T extends AssetKind> = {
     title: string;
     coverUrl: string;
     tags: string[];
+    group?: string;
     source?: string;
     note?: string;
     createdAt: string;
@@ -28,12 +29,25 @@ type AssetBase<T extends AssetKind> = {
 type AssetStore = {
     hydrated: boolean;
     assets: Asset[];
+    groups: string[];
+    addGroup: (name: string) => boolean;
+    renameGroup: (name: string, nextName: string) => boolean;
+    removeGroup: (name: string) => void;
+    moveAssets: (ids: string[], group?: string) => void;
     addAsset: (asset: Omit<Asset, "id" | "createdAt" | "updatedAt">) => string;
     updateAsset: (id: string, patch: Partial<Omit<Asset, "id" | "createdAt">>) => void;
     removeAsset: (id: string) => void;
     replaceAssets: (assets: Asset[]) => void;
     cleanupImages: (extra?: unknown) => void;
 };
+
+export function getAssetGroups(groups: string[], assets: Asset[]) {
+    return Array.from(new Set([...groups, ...assets.map((asset) => asset.group || "")].map((name) => name.trim()).filter(Boolean)));
+}
+
+export function matchesAssetGroup(asset: Asset, group?: string) {
+    return group === undefined || (asset.group?.trim() || "") === group;
+}
 
 const ASSET_STORE_KEY = "infinite-canvas:asset_store";
 
@@ -68,6 +82,38 @@ export const useAssetStore = create<AssetStore>()(
         (set, get) => ({
             hydrated: false,
             assets: [],
+            groups: [],
+            addGroup: (name) => {
+                const group = name.trim();
+                if (!group || getAssetGroups(get().groups, get().assets).includes(group)) return false;
+                set((state) => ({ groups: [...state.groups, group] }));
+                return true;
+            },
+            renameGroup: (name, nextName) => {
+                const group = nextName.trim();
+                const available = getAssetGroups(get().groups, get().assets);
+                if (!group || !available.includes(name) || (name !== group && available.includes(group))) return false;
+                if (name === group) return true;
+                const now = new Date().toISOString();
+                set((state) => ({
+                    groups: [...state.groups.filter((item) => item !== name), group],
+                    assets: state.assets.map((asset) => matchesAssetGroup(asset, name) ? { ...asset, group, updatedAt: now } : asset),
+                }));
+                return true;
+            },
+            removeGroup: (name) => {
+                const now = new Date().toISOString();
+                set((state) => ({
+                    groups: state.groups.filter((group) => group !== name),
+                    assets: state.assets.map((asset) => matchesAssetGroup(asset, name) ? { ...asset, group: undefined, updatedAt: now } : asset),
+                }));
+            },
+            moveAssets: (ids, name) => {
+                const selected = new Set(ids);
+                const group = name?.trim() || undefined;
+                const now = new Date().toISOString();
+                set((state) => ({ assets: state.assets.map((asset) => selected.has(asset.id) ? { ...asset, group, updatedAt: now } : asset) }));
+            },
             addAsset: (asset) => {
                 const now = new Date().toISOString();
                 const id = nanoid();
@@ -96,7 +142,7 @@ export const useAssetStore = create<AssetStore>()(
         {
             name: ASSET_STORE_KEY,
             storage: assetStorage,
-            partialize: (state) => ({ assets: state.assets }) as StorageValue<AssetStore>["state"],
+            partialize: (state) => ({ assets: state.assets, groups: state.groups }) as StorageValue<AssetStore>["state"],
             onRehydrateStorage: () => () => {
                 useAssetStore.setState({ hydrated: true });
             },

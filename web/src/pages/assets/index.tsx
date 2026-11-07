@@ -1,15 +1,16 @@
-import { Copy, Download, PencilLine, Search, Trash2, Upload } from "lucide-react";
+import { Copy, Download, FolderPlus, ListChecks, PencilLine, Search, Trash2, Upload } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { App, Button, Card, Drawer, Empty, Form, Image, Input, Modal, Pagination, Select, Space, Tag, Typography } from "antd";
+import { App, Button, Card, Checkbox, Drawer, Empty, Form, Image, Input, Modal, Pagination, Select, Space, Tag, Typography } from "antd";
 import { saveAs } from "file-saver";
 import { useTranslation } from "react-i18next";
 
+import { AssetGroupSelect } from "@/components/assets/asset-group-select";
 import { useCopyText } from "@/hooks/use-copy-text";
 import { formatBytes, readFileAsDataUrl } from "@/lib/image-utils";
 import { getMediaBlob } from "@/services/file-storage";
 import { getImageBlob, uploadImage } from "@/services/image-storage";
 import { cn } from "@/lib/utils";
-import { useAssetStore, type Asset, type AssetKind, type ImageAsset } from "@/stores/use-asset-store";
+import { matchesAssetGroup, useAssetStore, type Asset, type AssetKind, type ImageAsset } from "@/stores/use-asset-store";
 import { exportAssets, readAssetPackage } from "./asset-transfer";
 
 type AssetFormValues = {
@@ -17,6 +18,7 @@ type AssetFormValues = {
     title: string;
     coverUrl: string;
     tags: string[];
+    group?: string;
     source?: string;
     note?: string;
     content?: string;
@@ -38,6 +40,17 @@ export default function AssetsPage() {
     const addAsset = useAssetStore((state) => state.addAsset);
     const updateAsset = useAssetStore((state) => state.updateAsset);
     const removeAsset = useAssetStore((state) => state.removeAsset);
+    const addGroup = useAssetStore((state) => state.addGroup);
+    const renameGroup = useAssetStore((state) => state.renameGroup);
+    const removeGroup = useAssetStore((state) => state.removeGroup);
+    const moveAssets = useAssetStore((state) => state.moveAssets);
+    const [groupFilter, setGroupFilter] = useState<string>();
+    const [groupEditor, setGroupEditor] = useState<{ name: string; original?: string } | null>(null);
+    const [groupError, setGroupError] = useState("");
+    const [deletingGroup, setDeletingGroup] = useState<string>();
+    const [selectMode, setSelectMode] = useState(false);
+    const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+    const [moveTarget, setMoveTarget] = useState("");
     const [keyword, setKeyword] = useState("");
     const [kindFilter, setKindFilter] = useState<AssetKind | "all">("all");
     const [page, setPage] = useState(1);
@@ -57,11 +70,48 @@ export default function AssetsPage() {
     const filteredAssets = useMemo(() => {
         const query = keyword.trim().toLowerCase();
         return validAssets.filter((asset) => {
-            if (kindFilter !== "all" && asset.kind !== kindFilter) return false;
+            if (!matchesAssetGroup(asset, groupFilter) || (kindFilter !== "all" && asset.kind !== kindFilter)) return false;
             if (!query) return true;
             return assetSearchText(asset).includes(query);
         });
-    }, [validAssets, keyword, kindFilter]);
+    }, [validAssets, keyword, kindFilter, groupFilter]);
+
+    const selectedAssets = useMemo(() => validAssets.filter((asset) => selectedIds.has(asset.id)), [validAssets, selectedIds]);
+    const allSelected = filteredAssets.length > 0 && filteredAssets.every((asset) => selectedIds.has(asset.id));
+    const toggleSelected = (id: string) => setSelectedIds((current) => {
+        const next = new Set(current);
+        next.has(id) ? next.delete(id) : next.add(id);
+        return next;
+    });
+    const exitSelect = () => {
+        setSelectMode(false);
+        setSelectedIds(new Set());
+        setMoveTarget("");
+    };
+    const saveGroup = () => {
+        if (!groupEditor) return;
+        const name = groupEditor.name.trim();
+        if (!name) {
+            setGroupError(t("assets.group.nameRequired"));
+            return;
+        }
+        const saved = groupEditor.original ? renameGroup(groupEditor.original, name) : addGroup(name);
+        if (!saved) {
+            setGroupError(t("assets.group.nameExists"));
+            return;
+        }
+        setGroupFilter(name);
+        if (moveTarget === groupEditor.original) setMoveTarget(name);
+        setPage(1);
+        setGroupEditor(null);
+        message.success(t(groupEditor.original ? "assets.group.renamed" : "assets.group.created"));
+    };
+    const confirmMove = () => {
+        if (!selectedAssets.length) return;
+        moveAssets(selectedAssets.map((asset) => asset.id), moveTarget);
+        message.success(t("assets.group.moved", { count: selectedAssets.length }));
+        exitSelect();
+    };
 
     const visibleAssets = useMemo(() => {
         const start = (page - 1) * pageSize;
@@ -77,7 +127,7 @@ export default function AssetsPage() {
         setEditingAsset(null);
         setImageDraft(null);
         setFormKind("text");
-        form.setFieldsValue({ kind: "text", title: "", coverUrl: "", tags: [], source: t("assets.manual"), note: "", content: "" });
+        form.setFieldsValue({ kind: "text", title: "", coverUrl: "", tags: [], group: groupFilter || "", source: t("assets.manual"), note: "", content: "" });
         setIsAssetOpen(true);
     };
 
@@ -90,6 +140,7 @@ export default function AssetsPage() {
             title: asset.title,
             coverUrl: asset.coverUrl,
             tags: asset.tags || [],
+            group: asset.group?.trim() || "",
             source: asset.source,
             note: asset.note,
             content: asset.kind === "text" ? asset.data.content : "",
@@ -103,12 +154,15 @@ export default function AssetsPage() {
             title: values.title.trim(),
             coverUrl: values.coverUrl?.trim() || (values.kind === "image" && imageDraft ? imageDraft.dataUrl : ""),
             tags: values.tags || [],
+            group: values.group?.trim() || undefined,
             source: values.source?.trim(),
             note: values.note?.trim(),
             metadata: editingAsset?.metadata || { source: "manual" },
         };
 
-        if (values.kind === "text") {
+        if (editingAsset?.kind === "video") {
+            updateAsset(editingAsset.id, base);
+        } else if (values.kind === "text") {
             const asset = { ...base, kind: "text" as const, data: { content: (values.content || "").trim() } };
             editingAsset ? updateAsset(editingAsset.id, asset) : addAsset(asset);
         } else {
@@ -269,9 +323,43 @@ export default function AssetsPage() {
                 </div>
 
                 <div className="mx-auto flex max-w-7xl flex-col gap-5">
+                    <div className="flex flex-wrap items-center gap-2">
+                        <span className="mr-1 text-xs font-medium text-stone-500 dark:text-stone-400">{t("assets.group.label")}</span>
+                        <AssetGroupSelect className="w-48" allowAll value={groupFilter} onChange={(value) => { setGroupFilter(value); setPage(1); }} />
+                        <Button type="text" icon={<FolderPlus className="size-4" />} onClick={() => { setGroupError(""); setGroupEditor({ name: "" }); }}>
+                            {t("assets.group.create")}
+                        </Button>
+                        {groupFilter ? (
+                            <>
+                                <Button type="text" icon={<PencilLine className="size-4" />} onClick={() => { setGroupError(""); setGroupEditor({ name: groupFilter, original: groupFilter }); }}>
+                                    {t("assets.group.rename")}
+                                </Button>
+                                <Button type="text" danger icon={<Trash2 className="size-4" />} onClick={() => setDeletingGroup(groupFilter)}>
+                                    {t("assets.group.delete")}
+                                </Button>
+                            </>
+                        ) : null}
+                        <Button type="text" className="sm:ml-auto" icon={<ListChecks className="size-4" />} onClick={() => selectMode ? exitSelect() : setSelectMode(true)}>
+                            {selectMode ? t("common.cancel") : t("assets.group.select")}
+                        </Button>
+                    </div>
+                    {selectMode ? (
+                        <div className="flex flex-wrap items-center gap-3">
+                            <Checkbox checked={allSelected} indeterminate={!allSelected && filteredAssets.some((asset) => selectedIds.has(asset.id))} onChange={() => setSelectedIds((current) => {
+                                const next = new Set(current);
+                                filteredAssets.forEach((asset) => allSelected ? next.delete(asset.id) : next.add(asset.id));
+                                return next;
+                            })}>{t("assets.group.selectAll")}</Checkbox>
+                            <Typography.Text type="secondary">{t("assets.group.selected", { count: selectedAssets.length })}</Typography.Text>
+                            <AssetGroupSelect className="w-48" value={moveTarget} onChange={(value) => setMoveTarget(value || "")} />
+                            <Button disabled={!selectedAssets.length} onClick={confirmMove}>
+                                {t("assets.group.move")}
+                            </Button>
+                        </div>
+                    ) : null}
                     <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
                         {visibleAssets.map((asset) => (
-                            <AssetCard key={asset.id} asset={asset} onOpen={() => setPreviewAsset(asset)} onEdit={() => openEdit(asset)} onCopy={copyAssetText} onDownload={downloadImage} onDelete={() => setDeletingAsset(asset)} />
+                            <AssetCard key={asset.id} asset={asset} selecting={selectMode} selected={selectedIds.has(asset.id)} onSelect={() => toggleSelected(asset.id)} onOpen={() => setPreviewAsset(asset)} onEdit={() => openEdit(asset)} onCopy={copyAssetText} onDownload={downloadImage} onDelete={() => setDeletingAsset(asset)} />
                         ))}
                     </div>
 
@@ -298,9 +386,11 @@ export default function AssetsPage() {
                     <Form form={form} layout="vertical" requiredMark={false} initialValues={{ kind: "text", tags: [] }}>
                         <Form.Item name="kind" label={t("assets.type")}>
                             <Select
+                                disabled={editingAsset?.kind === "video"}
                                 options={[
                                     { label: t("assets.kinds.text"), value: "text" },
                                     { label: t("assets.kinds.image"), value: "image" },
+                                    ...(editingAsset?.kind === "video" ? [{ label: t("assets.kinds.video"), value: "video" }] : []),
                                 ]}
                                 onChange={(value) => setFormKind(value)}
                             />
@@ -316,6 +406,9 @@ export default function AssetsPage() {
                                 </Button>
                             </Space.Compact>
                         </Form.Item>
+                        <Form.Item name="group" label={t("assets.group.label")}>
+                            <AssetGroupSelect className="w-full" />
+                        </Form.Item>
                         <Form.Item name="tags" label={t("assets.fields.tags")}>
                             <Select mode="tags" tokenSeparators={[",", "，"]} placeholder={t("assets.fields.tagsPlaceholder")} />
                         </Form.Item>
@@ -330,6 +423,10 @@ export default function AssetsPage() {
                         {formKind === "text" ? (
                             <Form.Item name="content" label={t("assets.fields.textContent")} rules={[{ required: true, message: t("assets.fields.textRequired") }]}>
                                 <Input.TextArea rows={8} placeholder={t("assets.fields.textPlaceholder")} />
+                            </Form.Item>
+                        ) : editingAsset?.kind === "video" ? (
+                            <Form.Item label={t("assets.group.videoContent")}>
+                                <video src={editingAsset.data.url} controls className="max-h-64 w-full rounded-lg" />
                             </Form.Item>
                         ) : (
                             <Form.Item label={t("assets.fields.imageContent")} required>
@@ -403,6 +500,25 @@ export default function AssetsPage() {
 
             <input ref={assetInputRef} type="file" accept="application/zip,.zip" className="hidden" onChange={(event) => void importAssetZip(event.target.files?.[0])} />
 
+            <Modal title={t(groupEditor?.original ? "assets.group.rename" : "assets.group.create")} open={Boolean(groupEditor)} onCancel={() => setGroupEditor(null)} onOk={saveGroup} okText={t("common.save")} cancelText={t("common.cancel")} destroyOnHidden>
+                <Form layout="vertical" requiredMark={false}>
+                    <Form.Item label={t("assets.group.name")} validateStatus={groupError ? "error" : undefined} help={groupError || undefined}>
+                        <Input autoFocus value={groupEditor?.name || ""} placeholder={t("assets.group.namePlaceholder")} onChange={(event) => { setGroupEditor((current) => current ? { ...current, name: event.target.value } : null); setGroupError(""); }} onPressEnter={saveGroup} />
+                    </Form.Item>
+                </Form>
+            </Modal>
+            <Modal title={t("assets.group.delete")} open={Boolean(deletingGroup)} onCancel={() => setDeletingGroup(undefined)} onOk={() => {
+                if (!deletingGroup) return;
+                removeGroup(deletingGroup);
+                if (groupFilter === deletingGroup) setGroupFilter("");
+                if (moveTarget === deletingGroup) setMoveTarget("");
+                setDeletingGroup(undefined);
+                setPage(1);
+                message.success(t("assets.group.deleted"));
+            }} okText={t("common.delete")} okButtonProps={{ danger: true }} cancelText={t("common.cancel")}>
+                {t("assets.group.deleteConfirm", { name: deletingGroup })}
+            </Modal>
+
             <Modal title={t("assets.deleteTitle")} open={Boolean(deletingAsset)} onCancel={() => setDeletingAsset(null)} onOk={confirmDelete} okText={t("common.delete")} okButtonProps={{ danger: true }} cancelText={t("common.cancel")}>
                 {t("assets.deleteConfirm", { name: deletingAsset?.title })}
             </Modal>
@@ -410,7 +526,7 @@ export default function AssetsPage() {
     );
 }
 
-function AssetCard({ asset, onOpen, onEdit, onCopy, onDownload, onDelete }: { asset: Asset; onOpen: () => void; onEdit: () => void; onCopy: (asset: Asset) => void; onDownload: (asset: Asset) => void; onDelete: () => void }) {
+function AssetCard({ asset, selecting, selected, onSelect, onOpen, onEdit, onCopy, onDownload, onDelete }: { asset: Asset; selecting: boolean; selected: boolean; onSelect: () => void; onOpen: () => void; onEdit: () => void; onCopy: (asset: Asset) => void; onDownload: (asset: Asset) => void; onDelete: () => void }) {
     const { t } = useTranslation();
     const cover = asset.coverUrl || (asset.kind === "image" ? asset.data.dataUrl : "");
     const summary = assetSummary(asset);
@@ -420,7 +536,7 @@ function AssetCard({ asset, onOpen, onEdit, onCopy, onDownload, onDelete }: { as
             className="overflow-hidden"
             styles={{ body: { padding: 0 } }}
             cover={
-                <button type="button" className="block w-full text-left" onClick={onOpen}>
+                <button type="button" className="block w-full text-left" onClick={selecting ? onSelect : onOpen}>
                     {cover ? (
                         <img src={cover} alt={asset.title} className="aspect-[4/3] w-full object-cover" />
                     ) : (
@@ -429,7 +545,12 @@ function AssetCard({ asset, onOpen, onEdit, onCopy, onDownload, onDelete }: { as
                 </button>
             }
         >
-            <button type="button" className="block w-full text-left" onClick={onOpen}>
+            {selecting ? (
+                <div className="px-4 pt-3">
+                    <Checkbox aria-label={asset.title} checked={selected} onChange={onSelect} />
+                </div>
+            ) : null}
+            <button type="button" className="block w-full text-left" onClick={selecting ? onSelect : onOpen}>
                 <div className="p-4">
                     <div className="flex items-start justify-between gap-3">
                         <div className="min-w-0">
@@ -444,6 +565,7 @@ function AssetCard({ asset, onOpen, onEdit, onCopy, onDownload, onDelete }: { as
                         {summary}
                     </Typography.Paragraph>
                     <div className="mt-3 flex flex-wrap gap-1.5">
+                        <Tag className="m-0 max-w-full truncate text-[11px]">{asset.group?.trim() || t("assets.group.ungrouped")}</Tag>
                         {(asset.tags || []).slice(0, 3).map((tag) => (
                             <Tag key={tag} className="m-0 text-[11px]">
                                 {tag}
@@ -457,11 +579,9 @@ function AssetCard({ asset, onOpen, onEdit, onCopy, onDownload, onDelete }: { as
                 <Button size="small" onClick={onOpen}>
                     {t("common.view")}
                 </Button>
-                {asset.kind !== "video" ? (
-                    <Button size="small" icon={<PencilLine className="size-3.5" />} onClick={onEdit}>
-                        {t("common.edit")}
-                    </Button>
-                ) : null}
+                <Button size="small" icon={<PencilLine className="size-3.5" />} onClick={onEdit}>
+                    {t("common.edit")}
+                </Button>
                 {asset.kind === "text" ? (
                     <Button size="small" icon={<Copy className="size-3.5" />} onClick={() => void onCopy(asset)}>
                         {t("common.copy")}

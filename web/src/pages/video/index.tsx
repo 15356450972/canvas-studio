@@ -371,7 +371,8 @@ export default function VideoPage() {
         setResults((value) => (value.some((item) => item.id === log.id) ? value.map((item) => (item.id === log.id ? { ...item, taskId: item.taskId || log.task?.id } : item)) : [...value, { id: log.id, status: "pending", taskId: log.task?.id }]));
         const taskConfig = buildVideoConfig({ ...effectiveConfig, ...log.config }, log.task.model || log.model);
         try {
-            for (let attempt = 0; attempt < 120; attempt += 1) {
+            const unlimited = log.task.provider === "newtake";
+            for (let attempt = 0; unlimited || attempt < 120; attempt += 1) {
                 const state = await pollVideoGenerationTask(configOverride || taskConfig, log.task);
                 if (state.status === "completed") {
                     const stored = await storeGeneratedVideo(state.result);
@@ -393,7 +394,7 @@ export default function VideoPage() {
                     return;
                 }
                 if (state.status === "failed") throw new Error(state.error);
-                if (attempt === 119) throw new Error(t("videoWorkbench.timeout"));
+                if (!unlimited && attempt === 119) throw new Error(t("videoWorkbench.timeout"));
                 await delay(2500);
             }
         } catch (error) {
@@ -698,10 +699,19 @@ function GenerationSettings({ config, model, updateConfig, openConfigDialog }: {
 
 function ResultVideoCard({ video, taskId, onDownload, onSaveAsset }: { video: GeneratedVideo; taskId?: string; onDownload: (video: GeneratedVideo) => void; onSaveAsset: (video: GeneratedVideo) => void }) {
     const { t } = useTranslation();
+    const [playbackFailed, setPlaybackFailed] = useState(false);
     return (
         <ResultContextMenu taskId={taskId}>
         <div className="overflow-hidden rounded-lg border border-stone-200 bg-background dark:border-stone-800">
-            <video src={video.url} controls className="aspect-video w-full bg-black object-contain" />
+            <div className="relative">
+                <video src={video.url} controls className="aspect-video w-full bg-black object-contain" onError={() => setPlaybackFailed(true)} />
+                {playbackFailed ? (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-stone-900/90 px-6 text-center text-sm text-stone-100">
+                        <span className="font-medium">{t("videoWorkbench.playbackFailed")}</span>
+                        <span className="max-w-sm text-xs leading-5 text-stone-300">{t("videoWorkbench.playbackFailedHint")}</span>
+                    </div>
+                ) : null}
+            </div>
             <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-t border-stone-200 px-3 py-2.5 dark:border-stone-800">
                 <div className="flex min-w-0 flex-wrap gap-x-2 gap-y-1 text-xs text-stone-500 dark:text-stone-400">
                     <span>

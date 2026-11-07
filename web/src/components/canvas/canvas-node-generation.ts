@@ -37,14 +37,27 @@ type NodeGenerationGroupInput = {
 
 export type NodeGenerationInput = NodeGenerationResourceInput | NodeGenerationGroupInput;
 
-export function buildNodeGenerationContext(nodeId: string, nodes: CanvasNodeData[], connections: CanvasConnection[], prompt: string): NodeGenerationContext {
+export function buildNodeGenerationContext(nodeId: string, nodes: CanvasNodeData[], connections: CanvasConnection[], prompt: string, includeSourceImage = false): NodeGenerationContext {
     const inputs = buildNodeGenerationInputs(nodeId, nodes, connections);
+    const mentionedIds = new Set([...prompt.matchAll(/@\[node:([^\]]+)\]/g)].map((match) => match[1]));
+    // A node may also feed a config node; keep explicitly mentioned direct inputs available.
+    const directIds = new Set(connections.filter((connection) => connection.toNodeId === nodeId).map((connection) => connection.fromNodeId));
+    const inputIds = new Set(flattenGenerationInputs(inputs).map((input) => input.nodeId));
+    nodes.filter((node) => mentionedIds.has(node.id) && directIds.has(node.id) && !inputIds.has(node.id)).forEach((node) => inputs.push(...readNodeGenerationResource(node)));
     const sourceNode = nodes.find((node) => node.id === nodeId);
     if (sourceNode?.type === CanvasNodeType.Config && Boolean(sourceNode.metadata?.composerContent?.trim())) {
         return buildComposerGenerationContext(inputs, prompt);
     }
 
-    const resourceInputs = flattenGenerationInputs(inputs);
+    const sourceInputs = includeSourceImage && sourceNode?.type === CanvasNodeType.Image ? readNodeGenerationResource(sourceNode) : [];
+    const resourceInputs = flattenGenerationInputs([...sourceInputs, ...inputs]);
+    const counts = { image: 0, video: 0, audio: 0, text: 0 };
+    const labelByNodeId = new Map(resourceInputs.map((input) => [input.nodeId, generationLabel(input.type, counts[input.type]++)]));
+    const resolvedPrompt = prompt.replace(/@\[node:([^\]]+)\]/g, (_token, id: string) => {
+        const label = labelByNodeId.get(id);
+        if (!label) throw new Error(i18n.t("canvas.references.missing"));
+        return label;
+    });
     let textIndex = 0;
     const upstreamText = resourceInputs.flatMap((input) => (input.text ? [textBlock(generationLabel("text", textIndex++), input.text)] : [])).join("\n\n");
     const referenceImages = resourceInputs.map((input) => input.image).filter((image): image is ReferenceImage => Boolean(image));
@@ -52,7 +65,7 @@ export function buildNodeGenerationContext(nodeId: string, nodes: CanvasNodeData
     const referenceAudios = resourceInputs.map((input) => input.audio).filter((audio): audio is ReferenceAudio => Boolean(audio));
 
     return {
-        prompt: upstreamText ? `${prompt}\n\n${upstreamText}` : prompt,
+        prompt: upstreamText ? `${resolvedPrompt}\n\n${upstreamText}` : resolvedPrompt,
         referenceImages,
         referenceVideos,
         referenceAudios,

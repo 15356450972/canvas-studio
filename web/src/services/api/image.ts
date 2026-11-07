@@ -1,7 +1,7 @@
 import axios from "axios";
 
 import i18n from "@/i18n";
-import { buildApiUrl, guessCapability, isBuiltInChannel, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
+import { buildApiUrl, guessCapability, isBuiltInChannel, isOiioiiBaseUrl, isWankeChannel, OIIOII_CHANNEL_ID, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig, type ModelCapability, type ModelChannel } from "@/stores/use-config-store";
 import { normalizePluginImages, runModelPlugin } from "./model-plugin";
 import { nanoid } from "nanoid";
 import { dataUrlToFile } from "@/lib/image-utils";
@@ -253,29 +253,91 @@ function resolveImageSource(item: Record<string, unknown>) {
     return null;
 }
 
-function parseImagePayload(payload: ImageApiResponse) {
-    if (typeof payload.code === "number" && payload.code !== 0) {
-        throw new Error(payload.msg || apiText("requestFailed"));
-    }
-    // Support data, images, and results response fields used by different APIs.
+function imagePayloadSources(payload: ImageApiResponse) {
+    if (typeof payload.code === "number" && payload.code !== 0) return [];
     const imageList = payload.data
         || (payload as Record<string, unknown>).images as Array<Record<string, unknown>> | undefined
         || (payload as Record<string, unknown>).results as Array<Record<string, unknown>> | undefined
         || [];
-    const images = imageList
+    return imageList
         .map(resolveImageSource)
         .filter((value): value is string => Boolean(value))
         .map((dataUrl) => ({ id: nanoid(), dataUrl }));
+}
 
+function parseImagePayload(payload: ImageApiResponse) {
+    const images = imagePayloadSources(payload);
     if (images.length === 0) {
-        // Check whether the response contains data in an unrecognized format.
         const rawKeys = Object.keys(payload).filter((k) => k !== "code" && k !== "msg" && k !== "error");
         throw new Error(rawKeys.length > 0
             ? apiText("unknownImageResponse", { fields: rawKeys.join(", ") })
             : apiText("noImageReturned"));
     }
-
     return images;
+}
+
+function readImageTaskIds(payload: Record<string, unknown>) {
+    const ids: string[] = [];
+    if (Array.isArray(payload.task_ids)) {
+        for (const id of payload.task_ids) {
+            if (typeof id === "string" && id.trim()) ids.push(id.trim());
+        }
+    }
+    if (typeof payload.id === "string" && payload.id.trim() && (ids.length || isImageTaskStatus(payload.status))) {
+        const id = payload.id.trim();
+        if (!ids.includes(id)) ids.unshift(id);
+    }
+    return ids;
+}
+
+function isImageTaskStatus(status: unknown) {
+    return /^(queued|pending|running|processing|in_progress)$/i.test(String(status || ""));
+}
+
+function isAsyncImageTaskPayload(payload: unknown): payload is Record<string, unknown> {
+    return isRecord(payload) && !imagePayloadSources(payload as ImageApiResponse).length && readImageTaskIds(payload).length > 0;
+}
+
+async function waitForImageTasks(config: AiConfig, taskIds: string[], options?: RequestOptions) {
+    const images = await Promise.all(taskIds.map((taskId) => waitForImageTask(config, taskId, options)));
+    return images.flat();
+}
+
+async function waitForImageTask(config: AiConfig, taskId: string, options?: RequestOptions) {
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+        if (options?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+        try {
+            const payload = (await axios.get<ImageApiResponse>(aiApiUrl(config, `/tasks/${encodeURIComponent(taskId)}`), { headers: aiHeaders(config), signal: options?.signal })).data;
+            const status = String((payload as Record<string, unknown>).status || "").toLowerCase();
+            if (["failed", "failure", "error", "cancelled", "canceled"].includes(status)) {
+                throw new Error(readApiErrorMessage(payload) || apiText("imageGenerationFailed"));
+            }
+            const images = imagePayloadSources(payload);
+            if (images.length) return images.map((image) => ({ ...image, taskId }));
+            if (status === "completed" || status === "success" || status === "succeeded") throw new Error(apiText("noImageReturned"));
+        } catch (error) {
+            if (axios.isCancel(error) || options?.signal?.aborted) throw error;
+            if (axios.isAxiosError(error) && error.response) throw new Error(readAxiosError(error, apiText("imageTaskQueryFailed")));
+            if (error instanceof Error && !axios.isAxiosError(error)) throw error;
+            if (attempt === 119) throw new Error(readAxiosError(error, apiText("imageTaskQueryFailed")));
+        }
+        if (attempt === 119) throw new Error(apiText("imageTimeout"));
+        await delay(2500, options?.signal);
+    }
+    throw new Error(apiText("imageTimeout"));
+}
+
+async function resolveImageTaskResponse(config: AiConfig, payload: unknown, options?: RequestOptions) {
+    if (!isAsyncImageTaskPayload(payload)) return parseImagePayload(payload as ImageApiResponse);
+    const taskIds = readImageTaskIds(payload);
+    if (taskIds[0]) options?.onTaskCreated?.(taskIds[0]);
+    return waitForImageTasks(config, taskIds, options);
+}
+
+function usesOiioiiImageTasks(config: Pick<AiConfig, "baseUrl" | "channels">) {
+    if (isOiioiiBaseUrl(config.baseUrl)) return true;
+    const baseUrl = config.baseUrl.trim().replace(/\/+$/, "");
+    return (config.channels || []).some((channel) => channel.id === OIIOII_CHANNEL_ID && channel.baseUrl.trim().replace(/\/+$/, "") === baseUrl);
 }
 
 function readApiErrorMessage(value: unknown): string {
@@ -1018,6 +1080,18 @@ async function requestMiaowuImages(config: AiConfig, prompt: string, references:
     return (await Promise.all(tasks)).flat();
 }
 
+/** 页面刷新后按已保存的任务 id 继续等结果，只适用于异步任务渠道（喵呜、OiiOii 等返回 task id 的接口）。 */
+export async function resumeImageTask(config: AiConfig, taskId: string, options?: RequestOptions): Promise<RequestedImage> {
+    const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
+    try {
+        const images = isMiaowuImageEndpoint(requestConfig) ? await waitForMiaowuImageTask(requestConfig, taskId, options) : await waitForImageTask(requestConfig, taskId, options);
+        if (!images[0]) throw new Error(apiText("noImageReturned"));
+        return { ...images[0], taskId };
+    } catch (error) {
+        throw new Error(readAxiosError(error, apiText("imageTaskQueryFailed")));
+    }
+}
+
 export async function requestGeneration(config: AiConfig, prompt: string, options?: RequestOptions): Promise<RequestedImage[]> {
     const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
@@ -1067,14 +1141,14 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
                 // gpt-image models reject response_format; they always return b64.
                 ...(/gpt-image/.test(requestConfig.model) ? {} : { response_format: "b64_json" }),
                 output_format: IMAGE_OUTPUT_FORMAT,
+                ...(usesOiioiiImageTasks(requestConfig) ? { async: true } : {}),
             },
             {
                 headers: aiHeaders(requestConfig, "application/json"),
                 signal: options?.signal,
             },
         );
-        const images = await parseImagePayload(response.data);
-        return images;
+        return resolveImageTaskResponse(requestConfig, response.data, options);
     } catch (error) {
         throw new Error(readAxiosError(error, apiText("requestFailed")));
     }
@@ -1137,14 +1211,16 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
     if (background) {
         formData.set("background", background);
     }
+    if (usesOiioiiImageTasks(requestConfig)) {
+        formData.set("async", "true");
+    }
     const files = await Promise.all(references.map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image) })));
     const imageField = files.length > 1 ? "image[]" : "image";
     files.forEach((file) => formData.append(imageField, file));
 
     try {
         const response = await axios.post<ImageApiResponse>(aiApiUrl(requestConfig, "/images/edits"), formData, { headers: aiHeaders(requestConfig), signal: options?.signal });
-        const images = await parseImagePayload(response.data);
-        return images;
+        return resolveImageTaskResponse(requestConfig, response.data, options);
     } catch (error) {
         throw new Error(readAxiosError(error, apiText("requestFailed")));
     }
@@ -1241,7 +1317,7 @@ function parseDreamModelList(payload: { data?: DreamModelListItem[] } | undefine
 
 async function fetchMiaowuDreamModels(channel: ModelChannel): Promise<FetchedChannelModel[]> {
     try {
-        const response = await axios.get<{ data?: DreamModelListItem[]; error?: { message?: string } }>(buildApiUrl(channel.baseUrl, "/dream/model_list"), {
+        const response = await axios.get<{ data?: DreamModelListItem[]; error?: { message?: string } }>(buildApiUrl(channel.baseUrl, isWankeChannel(channel) ? "/dream/model_list?type=video" : "/dream/model_list"), {
             headers: { Authorization: `Bearer ${channel.apiKey}` },
         });
         const models = parseDreamModelList(response.data);
@@ -1253,7 +1329,7 @@ async function fetchMiaowuDreamModels(channel: ModelChannel): Promise<FetchedCha
 }
 
 export async function fetchChannelModels(channel: ModelChannel): Promise<FetchedChannelModel[]> {
-    if (isBuiltInChannel(channel)) return fetchMiaowuDreamModels(channel);
+    if (isBuiltInChannel(channel) || isWankeChannel(channel)) return fetchMiaowuDreamModels(channel);
     const names = await fetchImageModels({ baseUrl: channel.baseUrl, apiKey: channel.apiKey, apiFormat: channel.apiFormat });
     return names.map((name) => ({ name, capability: guessCapability(name) }));
 }

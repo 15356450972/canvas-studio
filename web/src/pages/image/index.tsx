@@ -1,6 +1,6 @@
-import { ArrowLeft, ArrowRight, BookOpen, CheckSquare, ClipboardPaste, Download, FolderPlus, History, ImagePlus, LoaderCircle, PenLine, Plus, SlidersHorizontal, Sparkles, Trash2, Upload } from "lucide-react";
+import { ArrowLeft, ArrowRight, BookOpen, CheckSquare, ClipboardPaste, Download, FileUp, FolderPlus, History, ImagePlus, LoaderCircle, PenLine, Plus, SlidersHorizontal, Sparkles, Square, Trash2, Upload } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { App, Button, Checkbox, Drawer, Dropdown, Empty, Image, Input, Modal, Tag, Tooltip, Typography } from "antd";
+import { App, Button, Checkbox, Drawer, Dropdown, Empty, Image, Input, InputNumber, Modal, Segmented, Tag, Tooltip, Typography } from "antd";
 import localforage from "localforage";
 import { saveAs } from "file-saver";
 import { useTranslation } from "react-i18next";
@@ -41,6 +41,8 @@ type GenerationResult = {
     image?: GeneratedImage;
     error?: string;
     taskId?: string;
+    /** Batch tasks keep their own prompt so retry reuses the original line. */
+    prompt?: string;
 };
 
 type GenerationLog = {
@@ -99,6 +101,12 @@ export default function ImagePage() {
     const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
     const [isReferenceDragActive, setIsReferenceDragActive] = useState(false);
     const [autoRunToken, setAutoRunToken] = useState(0);
+    const [mode, setMode] = useState<"single" | "batch">("single");
+    const [batchText, setBatchText] = useState("");
+    const [batchConcurrency, setBatchConcurrency] = useState<number | null>(3);
+    const [batchRunning, setBatchRunning] = useState(false);
+    const batchFileRef = useRef<HTMLInputElement>(null);
+    const batchStopRef = useRef(false);
     const imageCommand = useWorkbenchAgentStore((state) => state.imageCommand);
     const clearImageCommand = useWorkbenchAgentStore((state) => state.clearImageCommand);
     const updateAgentTask = useWorkbenchAgentStore((state) => state.updateTask);
@@ -112,10 +120,10 @@ export default function ImagePage() {
     const generationCount = Math.max(1, Math.min(10, Number(config.count) || 1));
 
     useEffect(() => {
-        if (!running || !startedAt) return;
+        if ((!running && !batchRunning) || !startedAt) return;
         const timer = window.setInterval(() => setElapsedMs(performance.now() - startedAt), 1000);
         return () => window.clearInterval(timer);
-    }, [running, startedAt]);
+    }, [running, batchRunning, startedAt]);
 
     useEffect(() => {
         void refreshLogs();
@@ -182,7 +190,7 @@ export default function ImagePage() {
             return;
         }
 
-        const slots = Array.from({ length: generationCount }, () => ({ id: nanoid(), status: "pending" as const }));
+        const slots = Array.from({ length: generationCount }, () => ({ id: nanoid(), status: "pending" as const, prompt: snapshot.text }));
         if (agentTaskId) updateAgentTask(agentTaskId, { status: "running", error: undefined });
         setPreviewLog(null);
         setResults((current) => [...current.filter((item) => item.status === "pending"), ...slots]);
@@ -255,16 +263,17 @@ export default function ImagePage() {
         message.success(t("imageWorkbench.addedReference"));
     };
 
-    const saveResultToAssets = async (image: GeneratedImage, index: number) => {
+    const saveResultToAssets = async (image: GeneratedImage, index: number, sourcePrompt: string) => {
         const stored = await uploadImage(image.dataUrl);
+        const assetName = /【([^【】]+)】/.exec(sourcePrompt)?.[1]?.trim();
         addAsset({
             kind: "image",
-            title: t("imageWorkbench.resultTitle", { count: index + 1 }),
+            title: assetName || t("imageWorkbench.resultTitle", { count: index + 1 }),
             coverUrl: stored.url,
             tags: [],
             source: t("imageWorkbench.source"),
             data: { dataUrl: stored.url, storageKey: stored.storageKey, width: stored.width, height: stored.height, bytes: stored.bytes, mimeType: stored.mimeType },
-            metadata: { source: "image-page", prompt },
+            metadata: { source: "image-page", prompt: sourcePrompt },
         });
         message.success(t("common.addedToAssets"));
     };
@@ -313,8 +322,7 @@ export default function ImagePage() {
         if (log.config.count) updateConfig("count", log.config.count);
     };
 
-    const buildRequestSnapshot = () => {
-        const text = prompt.trim();
+    const buildRequestSnapshot = (text = prompt.trim()) => {
         if (!text) {
             message.error(t("imageWorkbench.promptRequired"));
             return null;
@@ -357,8 +365,9 @@ export default function ImagePage() {
     };
 
     const retryResult = async (index: number) => {
-        const snapshot = buildRequestSnapshot();
-        const resultId = results[index]?.id;
+        const target = results[index];
+        const snapshot = buildRequestSnapshot(target?.prompt ?? prompt.trim());
+        const resultId = target?.id;
         if (!snapshot || !resultId) return;
         setPreviewLog(null);
         setResults((value) => updateResultAt(value, index, { status: "pending", error: undefined, image: undefined }));
@@ -384,8 +393,58 @@ export default function ImagePage() {
         }
     };
 
+    const runBatch = async () => {
+        const lines = batchText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+        if (!lines.length) return message.error(t("imageWorkbench.batchEmpty"));
+        const snapshot = buildRequestSnapshot(lines[0]);
+        if (!snapshot) return;
+
+        const slots = lines.map((line) => ({ id: nanoid(), status: "pending" as const, prompt: line }));
+        const limit = batchConcurrency && batchConcurrency > 0 ? batchConcurrency : lines.length;
+        let cursor = 0;
+        batchStopRef.current = false;
+        setPreviewLog(null);
+        setBatchRunning(true);
+        setResults((current) => [...current.filter((item) => item.status === "pending"), ...slots]);
+        const batchStartedAt = performance.now();
+        if (!startedAtRef.current) {
+            startedAtRef.current = batchStartedAt;
+            setStartedAt(batchStartedAt);
+            setElapsedMs(0);
+        }
+
+        const worker = async () => {
+            while (!batchStopRef.current) {
+                const slot = slots[cursor++];
+                if (!slot) return;
+                const startedAt = performance.now();
+                try {
+                    const image = await runGenerationSlot(slot.id, { ...snapshot, text: slot.prompt });
+                    saveLog(buildLog({ prompt: slot.prompt, model, config: { ...snapshot.config, count: "1" }, references: snapshot.references, durationMs: performance.now() - startedAt, successCount: 1, failCount: 0, status: "success", images: [image] }));
+                } catch {
+                    // runGenerationSlot has already marked the result as failed.
+                }
+            }
+        };
+
+        await Promise.all(Array.from({ length: Math.min(limit, lines.length) }, worker));
+        startedAtRef.current = 0;
+        setBatchRunning(false);
+        setElapsedMs(0);
+        // Drop the rows that were never dispatched so they do not stay on "generating".
+        const unstarted = new Set(slots.slice(cursor).map((slot) => slot.id));
+        setResults((current) => current.filter((item) => !unstarted.has(item.id)));
+        const skipped = unstarted.size;
+        message.success(skipped > 0 ? t("imageWorkbench.batchStopped", { done: lines.length - skipped, skipped }) : t("imageWorkbench.batchDone", { count: lines.length }));
+    };
+
+    const stopBatch = () => {
+        batchStopRef.current = true;
+        message.info(t("imageWorkbench.batchStopping"));
+    };
+
     const liveResults = previewLog ? results.filter((item) => item.status === "pending") : results;
-    const previewResults: GenerationResult[] = previewLog ? previewLog.images.map((image) => ({ id: image.id, status: "success", image, taskId: image.taskId })) : [];
+    const previewResults: GenerationResult[] = previewLog ? previewLog.images.map((image) => ({ id: image.id, status: "success", image, taskId: image.taskId, prompt: previewLog.prompt })) : [];
     const hasVisibleResults = liveResults.length > 0 || previewResults.length > 0;
 
     const renderImageResult = (result: GenerationResult, index: number, canRemove: boolean) => {
@@ -398,15 +457,15 @@ export default function ImagePage() {
                     taskId={result.image.taskId || result.taskId}
                     onEdit={addResultToReferences}
                     onDownload={downloadImage}
-                    onSaveAsset={saveResultToAssets}
+                    onSaveAsset={(image, imageIndex) => saveResultToAssets(image, imageIndex, result.prompt ?? "")}
                     onRemove={canRemove ? () => removeResult(result.id) : undefined}
                 />
             );
         }
         if (result.status === "failed") {
-            return <FailedImageCard key={result.id} error={result.error || t("workbench.generationFailed")} taskId={result.taskId} onRetry={() => retryResult(results.findIndex((item) => item.id === result.id))} onRemove={canRemove ? () => removeResult(result.id) : undefined} />;
+            return <FailedImageCard key={result.id} error={result.error || t("workbench.generationFailed")} taskId={result.taskId} prompt={result.prompt} onRetry={() => retryResult(results.findIndex((item) => item.id === result.id))} onRemove={canRemove ? () => removeResult(result.id) : undefined} />;
         }
-        return <PendingImageCard key={result.id} taskId={result.taskId} onRemove={canRemove ? () => removeResult(result.id) : undefined} />;
+        return <PendingImageCard key={result.id} taskId={result.taskId} prompt={result.prompt} onRemove={canRemove ? () => removeResult(result.id) : undefined} />;
     };
 
     return (
@@ -445,17 +504,47 @@ export default function ImagePage() {
                         <div className="mt-6 space-y-5">
                             <div>
                                 <div className="mb-2 flex items-center justify-between gap-3">
-                                    <span className="text-base font-semibold">{t("workbench.prompt")}</span>
-                                    <div className="flex gap-2">
-                                        <Button size="small" icon={<BookOpen className="size-3.5" />} onClick={() => setPromptDialogOpen(true)}>
+                                    <div className="flex min-w-0 items-center gap-2">
+                                        <span className="text-base font-semibold">{t("workbench.prompt")}</span>
+                                        <Segmented
+                                            size="small"
+                                            value={mode}
+                                            options={[
+                                                { label: t("imageWorkbench.modeSingle"), value: "single" },
+                                                { label: t("imageWorkbench.modeBatch"), value: "batch" },
+                                            ]}
+                                            disabled={running || batchRunning}
+                                            onChange={(value) => setMode(value as "single" | "batch")}
+                                        />
+                                    </div>
+                                    <div className="flex shrink-0 gap-2">
+                                        <Button size="small" icon={<BookOpen className="size-3.5" />} disabled={mode === "batch"} onClick={() => setPromptDialogOpen(true)}>
                                             {t("workbench.viewPrompts")}
                                         </Button>
-                                        <Button size="small" icon={<FolderPlus className="size-3.5" />} onClick={() => setAssetPickerOpen(true)}>
+                                        <Button size="small" icon={<FolderPlus className="size-3.5" />} disabled={mode === "batch"} onClick={() => setAssetPickerOpen(true)}>
                                             {t("workbench.viewAssets")}
                                         </Button>
                                     </div>
                                 </div>
-                                <Input.TextArea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={7} placeholder={t("imageWorkbench.promptPlaceholder")} />
+                                {mode === "batch" ? (
+                                    <div className="space-y-2">
+                                        <Input.TextArea value={batchText} onChange={(event) => setBatchText(event.target.value)} rows={7} placeholder={t("imageWorkbench.batchPlaceholder")} disabled={batchRunning} />
+                                        <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-stone-500 dark:text-stone-400">
+                                            <span>{t("imageWorkbench.batchLineCount", { count: batchText.split(/\r?\n/).filter((line) => line.trim()).length })}</span>
+                                            <div className="flex items-center gap-2">
+                                                <span>{t("imageWorkbench.batchConcurrency")}</span>
+                                                <Tooltip title={t("imageWorkbench.batchConcurrencyHint")}>
+                                                    <InputNumber size="small" min={1} precision={0} className="!w-20" value={batchConcurrency} placeholder={t("imageWorkbench.batchUnlimited")} disabled={batchRunning} onChange={(value) => setBatchConcurrency(value)} />
+                                                </Tooltip>
+                                                <Button size="small" icon={<FileUp className="size-3.5" />} disabled={batchRunning} onClick={() => batchFileRef.current?.click()}>
+                                                    {t("imageWorkbench.batchImport")}
+                                                </Button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                ) : (
+                                    <Input.TextArea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={7} placeholder={t("imageWorkbench.promptPlaceholder")} />
+                                )}
                             </div>
 
                             <div className="min-w-0">
@@ -532,9 +621,15 @@ export default function ImagePage() {
                         </div>
 
                         <div className="mt-auto pt-6">
-                            <Button type="primary" size="large" block icon={<Sparkles className="size-4" />} disabled={!canGenerate} onClick={() => void generate()}>
-                                {t("workbench.generate")}
-                            </Button>
+                            {batchRunning ? (
+                                <Button size="large" block danger icon={<Square className="size-3.5 fill-current" />} onClick={stopBatch}>
+                                    {t("imageWorkbench.batchStop")}
+                                </Button>
+                            ) : (
+                                <Button type="primary" size="large" block icon={<Sparkles className="size-4" />} disabled={mode === "batch" ? !batchText.trim() : !canGenerate} onClick={() => void (mode === "batch" ? runBatch() : generate())}>
+                                    {mode === "batch" ? t("imageWorkbench.batchGenerate", { count: batchText.split(/\r?\n/).filter((line) => line.trim()).length }) : t("workbench.generate")}
+                                </Button>
+                            )}
                         </div>
                     </div>
 
@@ -549,7 +644,7 @@ export default function ImagePage() {
                                         {t("workbench.clearResults")}
                                     </Button>
                                 ) : null}
-                                {running ? <Tag className="m-0 px-2 py-1">{t("workbench.waiting", { time: formatDuration(elapsedMs) })}</Tag> : null}
+                                {running || batchRunning ? <Tag className="m-0 px-2 py-1">{t("workbench.waiting", { time: formatDuration(elapsedMs) })}</Tag> : null}
                             </div>
                         </div>
                         {hasVisibleResults ? (
@@ -585,6 +680,20 @@ export default function ImagePage() {
                 onChange={(event) => {
                     void addReferences(event.target.files);
                     event.target.value = "";
+                }}
+            />
+            <input
+                ref={batchFileRef}
+                type="file"
+                accept=".txt,.csv,text/plain"
+                className="hidden"
+                onChange={async (event) => {
+                    const file = event.target.files?.[0];
+                    event.target.value = "";
+                    if (!file) return;
+                    const content = await file.text();
+                    setBatchText((current) => [current.trim(), content.trim()].filter(Boolean).join("\n"));
+                    message.success(t("imageWorkbench.batchImported", { count: content.split(/\r?\n/).filter((line) => line.trim()).length }));
                 }}
             />
             <Drawer title={t("workbench.logs")} placement="bottom" size="large" open={logsOpen} onClose={() => setLogsOpen(false)}>
@@ -685,7 +794,7 @@ function ResultImageCard({
     );
 }
 
-function PendingImageCard({ taskId, onRemove }: { taskId?: string; onRemove?: () => void }) {
+function PendingImageCard({ taskId, prompt, onRemove }: { taskId?: string; prompt?: string; onRemove?: () => void }) {
     const { t } = useTranslation();
     return (
         <ResultContextMenu taskId={taskId}>
@@ -697,9 +806,10 @@ function PendingImageCard({ taskId, onRemove }: { taskId?: string; onRemove?: ()
                     backgroundSize: "16px 16px",
                 }}
             />
-            <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-sm text-stone-500 dark:text-stone-400">
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-4 text-center text-sm text-stone-500 dark:text-stone-400">
                 <LoaderCircle className="size-6 animate-spin" />
                 <span>{t("workbench.generating")}</span>
+                {prompt ? <span className="line-clamp-3 text-xs leading-4 opacity-80">{prompt}</span> : null}
             </div>
             {onRemove ? <ResultRemoveButton onRemove={onRemove} /> : null}
         </div>
@@ -707,7 +817,7 @@ function PendingImageCard({ taskId, onRemove }: { taskId?: string; onRemove?: ()
     );
 }
 
-function FailedImageCard({ error, taskId, onRetry, onRemove }: { error: string; taskId?: string; onRetry: () => void; onRemove?: () => void }) {
+function FailedImageCard({ error, taskId, prompt, onRetry, onRemove }: { error: string; taskId?: string; prompt?: string; onRetry: () => void; onRemove?: () => void }) {
     const { t } = useTranslation();
     return (
         <ResultContextMenu taskId={taskId}>
@@ -715,6 +825,7 @@ function FailedImageCard({ error, taskId, onRetry, onRemove }: { error: string; 
             {onRemove ? <ResultRemoveButton onRemove={onRemove} /> : null}
             <div className="flex aspect-square flex-col items-center justify-center gap-3 p-5 text-center">
                 <div className="text-sm font-medium text-red-600 dark:text-red-300">{t("workbench.failed")}</div>
+                {prompt ? <div className="line-clamp-2 text-xs leading-4 text-red-500/80 dark:text-red-300/80">{prompt}</div> : null}
                 <Typography.Paragraph ellipsis={{ rows: 4 }} className="!mb-0 !text-xs !text-red-500 dark:!text-red-300">
                     {error}
                 </Typography.Paragraph>

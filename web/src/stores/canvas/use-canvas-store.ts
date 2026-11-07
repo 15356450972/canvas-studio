@@ -5,6 +5,7 @@ import { nanoid } from "nanoid";
 import i18n from "@/i18n";
 import { localForageStorage } from "@/lib/localforage-storage";
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
+import { saveCanvasProjectsToFolder } from "@/stores/canvas/use-canvas-folder-store";
 import type { CanvasAssistantSession, CanvasConnection, CanvasNodeData, ViewportTransform } from "@/types/canvas";
 
 export type CanvasProject = {
@@ -60,7 +61,7 @@ const canvasStorage: PersistStorage<CanvasStore> = {
         if (saveTimer) clearTimeout(saveTimer);
         saveTimer = setTimeout(() => {
             saveTimer = null;
-            void localForageStorage.setItem(name, JSON.stringify(value));
+            void Promise.resolve(localForageStorage.setItem(name, JSON.stringify(value))).then(() => saveCanvasProjectsToFolder(nextState.projects));
         }, 400);
     },
     removeItem: (name) => localForageStorage.removeItem(name),

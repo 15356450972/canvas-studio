@@ -1,5 +1,4 @@
 import axios from "axios";
-import localforage from "localforage";
 
 import i18n from "@/i18n";
 import { fetchableMediaUrl, isEphemeralMediaUrl, isStablePublicUrl } from "@/lib/media-url";
@@ -10,7 +9,6 @@ import { withLocalProxy } from "@/stores/use-config-store";
 const UGUU_UPLOAD = "https://uguu.se/upload";
 const DEV_UGUU_UPLOAD = "/__uguu/upload";
 const MAX_BYTES = 128 * 1024 * 1024;
-const cache = new Map<string, string>();
 
 export type PublicUploadSource = {
     name?: string;
@@ -29,38 +27,6 @@ type UguuUploadResponse = {
 };
 
 type UploadOptions = { signal?: AbortSignal; force?: boolean };
-
-const publicUrlStore = localforage.createInstance({ name: "infinite-canvas", storeName: "public_url_cache" });
-
-function cacheKeys(source: PublicUploadSource) {
-    return [source.storageKey, source.publicUrl, source.dataUrl, source.url].filter((value): value is string => Boolean(value));
-}
-
-async function readPublicUrlCache(key: string) {
-    const memory = cache.get(key);
-    if (memory) return memory;
-    const stored = await publicUrlStore.getItem<string>(key);
-    if (stored) cache.set(key, stored);
-    return stored || "";
-}
-
-async function writePublicUrlCache(keys: string[], url: string) {
-    await Promise.all(
-        keys.map(async (key) => {
-            cache.set(key, url);
-            await publicUrlStore.setItem(key, url);
-        }),
-    );
-}
-
-async function forgetPublicUrlCache(keys: string[]) {
-    await Promise.all(
-        keys.map(async (key) => {
-            cache.delete(key);
-            await publicUrlStore.removeItem(key);
-        }),
-    );
-}
 
 const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiErrors.${key}`, options);
 
@@ -128,35 +94,22 @@ export async function uploadPublicFile(blob: Blob, name: string, options?: Uploa
     }
 }
 
+/** 垫图只在真正发请求时上传，不缓存临时链接（uguu 约 3 小时过期）。 */
 export async function resolvePublicHttpUrl(source: PublicUploadSource, options?: UploadOptions) {
-    const keys = cacheKeys(source);
-    if (options?.force) await forgetPublicUrlCache(keys);
     const local = Boolean(source.storageKey || source.dataUrl?.startsWith("data:") || source.dataUrl?.startsWith("blob:"));
     if (!options?.force && !local) {
         const existing = isStablePublicUrl(source.publicUrl) || isStablePublicUrl(source.url) || isStablePublicUrl(source.dataUrl);
         if (existing) return existing;
-        for (const key of keys) {
-            const hit = await readPublicUrlCache(key);
-            if (hit) return hit;
-        }
     }
     const blob = await loadBlob(source, options?.signal);
-    const url = await uploadPublicFile(blob, fileName(source, blob), options);
-    if (keys.length) await writePublicUrlCache(keys, url);
-    return url;
+    return uploadPublicFile(blob, fileName(source, blob), options);
 }
 
 export async function resolvePublicHttpUrls(sources: PublicUploadSource[], options?: UploadOptions) {
     return Promise.all(sources.map((source) => resolvePublicHttpUrl(source, options)));
 }
 
+/** 生成结果只落本地，不再预先上传公网。 */
 export async function persistGeneratedImage(input: string | Blob, options?: UploadOptions): Promise<UploadedImage> {
-    const uploaded = await uploadImage(input, options);
-    if (!uploaded.storageKey) return uploaded;
-    try {
-        const publicUrl = await resolvePublicHttpUrl({ storageKey: uploaded.storageKey, dataUrl: uploaded.url, type: uploaded.mimeType, name: "image.png" }, options);
-        return { ...uploaded, publicUrl };
-    } catch {
-        return uploaded;
-    }
+    return uploadImage(input, options);
 }

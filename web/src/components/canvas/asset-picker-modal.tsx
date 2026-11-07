@@ -3,8 +3,9 @@ import { Empty, Input, Modal, Pagination, Tag } from "antd";
 import { Search } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
+import { AssetGroupSelect } from "@/components/assets/asset-group-select";
 import { cn } from "@/lib/utils";
-import { useAssetStore, type Asset } from "@/stores/use-asset-store";
+import { matchesAssetGroup, useAssetStore, type Asset } from "@/stores/use-asset-store";
 
 export type InsertAssetPayload = { kind: "text"; content: string; title: string } | { kind: "image"; dataUrl: string; title: string; storageKey?: string } | { kind: "video"; url: string; title: string; storageKey?: string; width?: number; height?: number };
 
@@ -57,15 +58,16 @@ function MyAssetsTab({ onInsert }: { onInsert: (payload: InsertAssetPayload) => 
     const assets = useAssetStore((state) => state.assets);
     const [keyword, setKeyword] = useState("");
     const [kindFilter, setKindFilter] = useState("all");
+    const [groupFilter, setGroupFilter] = useState<string>();
     const [page, setPage] = useState(1);
 
     const filtered = useMemo(() => {
         const query = keyword.trim().toLowerCase();
         return assets
             .filter((a) => a.kind === "text" || a.kind === "image" || a.kind === "video")
-            .filter((a) => kindFilter === "all" || a.kind === kindFilter)
+            .filter((a) => matchesAssetGroup(a, groupFilter) && (kindFilter === "all" || a.kind === kindFilter))
             .filter((a) => !query || [a.title, ...(a.tags || [])].join(" ").toLowerCase().includes(query));
-    }, [assets, keyword, kindFilter]);
+    }, [assets, keyword, kindFilter, groupFilter]);
 
     const visible = useMemo(() => filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE), [filtered, page]);
 
@@ -97,6 +99,7 @@ function MyAssetsTab({ onInsert }: { onInsert: (payload: InsertAssetPayload) => 
                         setKeyword(e.target.value);
                     }}
                 />
+                <AssetGroupSelect className="w-40" size="small" allowAll value={groupFilter} onChange={(value) => { setGroupFilter(value); setPage(1); }} />
                 <div className="flex gap-1.5">
                     {kindOptions.map((option) => (
                         <Tag.CheckableTag

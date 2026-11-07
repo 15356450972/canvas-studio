@@ -77,6 +77,14 @@ const OPENAI_BASE_URL = "https://api.openai.com";
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com";
 export const MIAOWU_CHANNEL_ID = "miaowu";
 export const MIAOWU_BASE_URL = "https://api.miaowuai.store";
+export const OIIOII_CHANNEL_ID = "oiioii";
+export const OIIOII_HOST = "64.83.9.159";
+export const OIIOII_BASE_URL = `http://${OIIOII_HOST}:18481`;
+export const NEWTAKE_CHANNEL_ID = "newtake";
+export const NEWTAKE_BASE_URL = "http://127.0.0.1:8765";
+export const NEWTAKE_MODEL = "wanx3.0";
+export const WANKE_CHANNEL_ID = "wanke";
+export const WANKE_BASE_URL = "https://api.wankeai.store";
 export const LOCAL_PROXY_PACKAGE = "@basketikun/canvas-proxy";
 export const DEFAULT_LOCAL_PROXY_URL = "http://127.0.0.1:23210";
 
@@ -94,6 +102,30 @@ export const defaultConfig: AiConfig = {
             apiFormat: "openai",
             builtIn: true,
             models: [],
+        },
+        {
+            id: OIIOII_CHANNEL_ID,
+            name: i18n.t("config.channels.oiioiiName"),
+            baseUrl: OIIOII_BASE_URL,
+            apiKey: "",
+            apiFormat: "openai",
+            models: [{ name: "gpt-image2", capability: "image" }],
+        },
+        {
+            id: NEWTAKE_CHANNEL_ID,
+            name: i18n.t("config.channels.newtakeName"),
+            baseUrl: NEWTAKE_BASE_URL,
+            apiKey: "",
+            apiFormat: "openai",
+            models: [{ name: NEWTAKE_MODEL, capability: "video" }],
+        },
+        {
+            id: WANKE_CHANNEL_ID,
+            name: i18n.t("config.channels.wankeName"),
+            baseUrl: WANKE_BASE_URL,
+            apiKey: "",
+            apiFormat: "openai",
+            models: [{ name: "seedance2", capability: "video" }],
         },
         {
             id: "default",
@@ -348,7 +380,78 @@ export function ensureMiaowuChannel(channels: ModelChannel[]) {
         if (isBuiltInChannel(channel)) inherited = { apiKey: channel.apiKey, models: channel.models };
         else others.push(channel);
     }
-    return [createMiaowuChannel(inherited), ...others];
+    return ensureWankeChannel(ensureNewtakeChannel(ensureOiioiiChannel([createMiaowuChannel(inherited), ...others])));
+}
+
+export function isOiioiiChannel(channel: Pick<ModelChannel, "id" | "baseUrl">) {
+    return channel.id === OIIOII_CHANNEL_ID || isOiioiiBaseUrl(channel.baseUrl);
+}
+
+export function isOiioiiBaseUrl(baseUrl: string) {
+    try {
+        return new URL(baseUrl.trim()).hostname === OIIOII_HOST;
+    } catch {
+        return baseUrl.includes(OIIOII_HOST);
+    }
+}
+
+export function createOiioiiChannel(overrides?: Partial<ModelChannel>): ModelChannel {
+    return createModelChannel({
+        id: OIIOII_CHANNEL_ID,
+        name: overrides?.name?.trim() || i18n.t("config.channels.oiioiiName"),
+        baseUrl: overrides?.baseUrl?.trim() || OIIOII_BASE_URL,
+        apiFormat: "openai",
+        apiKey: overrides?.apiKey || "",
+        models: overrides?.models?.length ? overrides.models : [{ name: "gpt-image2", capability: "image" }],
+    });
+}
+
+export function ensureOiioiiChannel(channels: ModelChannel[]) {
+    const index = channels.findIndex(isOiioiiChannel);
+    if (index >= 0) return channels;
+    const miaowuIndex = channels.findIndex(isBuiltInChannel);
+    const insertAt = miaowuIndex >= 0 ? miaowuIndex + 1 : 0;
+    return [...channels.slice(0, insertAt), createOiioiiChannel(), ...channels.slice(insertAt)];
+}
+
+export function isNewtakeChannel(channel: Pick<ModelChannel, "id" | "baseUrl">) {
+    return channel.id === NEWTAKE_CHANNEL_ID || normalizedBaseUrlKey(channel.baseUrl) === normalizedBaseUrlKey(NEWTAKE_BASE_URL);
+}
+
+/** 请求配置只带 baseUrl，按渠道列表反查是不是 Newtake 出片台。 */
+export function isNewtakeRequest(config: Pick<AiConfig, "baseUrl" | "channels">) {
+    const key = normalizedBaseUrlKey(config.baseUrl);
+    return key === normalizedBaseUrlKey(NEWTAKE_BASE_URL) || (config.channels || []).some((channel) => channel.id === NEWTAKE_CHANNEL_ID && normalizedBaseUrlKey(channel.baseUrl) === key);
+}
+
+export function ensureNewtakeChannel(channels: ModelChannel[]) {
+    if (channels.some(isNewtakeChannel)) return channels;
+    const index = channels.findIndex(isOiioiiChannel);
+    const insertAt = index >= 0 ? index + 1 : 0;
+    const channel = createModelChannel({ id: NEWTAKE_CHANNEL_ID, name: i18n.t("config.channels.newtakeName"), baseUrl: NEWTAKE_BASE_URL, apiFormat: "openai", models: [{ name: NEWTAKE_MODEL, capability: "video" }] });
+    return [...channels.slice(0, insertAt), channel, ...channels.slice(insertAt)];
+}
+
+export function isWankeChannel(channel: Pick<ModelChannel, "id" | "baseUrl">) {
+    return channel.id === WANKE_CHANNEL_ID || normalizedBaseUrlKey(channel.baseUrl) === normalizedBaseUrlKey(WANKE_BASE_URL);
+}
+
+export function ensureWankeChannel(channels: ModelChannel[]) {
+    if (channels.some(isWankeChannel)) return channels;
+    const index = channels.findIndex(isNewtakeChannel);
+    const insertAt = index >= 0 ? index + 1 : 0;
+    const channel = createModelChannel({ id: WANKE_CHANNEL_ID, name: i18n.t("config.channels.wankeName"), baseUrl: WANKE_BASE_URL, apiFormat: "openai", models: [{ name: "seedance2", capability: "video" }] });
+    return [...channels.slice(0, insertAt), channel, ...channels.slice(insertAt)];
+}
+
+export function rewriteOiioiiSameOriginUrl(url: string) {
+    try {
+        const parsed = new URL(url);
+        if (parsed.hostname === OIIOII_HOST) return `/__oiioii${parsed.pathname}${parsed.search}`;
+    } catch {
+        /* keep the original URL */
+    }
+    return url;
 }
 
 export function lockBuiltInChannel(channel: ModelChannel) {
@@ -531,6 +634,8 @@ export function normalizeLocalProxyUrl(value: string) {
 
 /** Prefix an outgoing request with the local forwarding proxy so the browser is not blocked by CORS. */
 export function withLocalProxy(url: string) {
+    const rewritten = rewriteOiioiiSameOriginUrl(url);
+    if (rewritten !== url) return rewritten;
     const { proxyEnabled, proxyUrl } = useConfigStore.getState().config;
     if (!proxyEnabled || !/^https?:\/\//i.test(url)) return url;
     const base = normalizeLocalProxyUrl(proxyUrl);

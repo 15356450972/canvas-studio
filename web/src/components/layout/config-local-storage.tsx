@@ -1,10 +1,11 @@
-import { Alert, Button, Progress, Spin } from "antd";
+import { Alert, App, Button, Progress, Spin } from "antd";
 import type { TFunction } from "i18next";
-import { Database, HardDrive, Layers3, RefreshCw } from "lucide-react";
+import { Database, FolderOpen, HardDrive, Layers3, RefreshCw, Save } from "lucide-react";
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
 import { readLocalStorageUsage, type LocalStorageUsage } from "@/services/local-storage-usage";
+import { useCanvasFolderStore } from "@/stores/canvas/use-canvas-folder-store";
 
 const storeLabelKeys: Record<string, string> = {
     app_state: "appState",
@@ -43,6 +44,7 @@ export function ConfigLocalStorage({ active }: { active: boolean }) {
 
     return (
         <div className="space-y-3">
+            <CanvasFolderSection active={active} />
             <section className="rounded-lg border border-stone-200 p-4 dark:border-stone-800">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                     <div>
@@ -100,6 +102,54 @@ export function ConfigLocalStorage({ active }: { active: boolean }) {
                 </section>
             ))}
         </div>
+    );
+}
+
+function CanvasFolderSection({ active }: { active: boolean }) {
+    const { t } = useTranslation();
+    const { message } = App.useApp();
+    const { status, folderName, lastSavedAt, error, load, pickFolder, saveNow, disable } = useCanvasFolderStore();
+
+    useEffect(() => {
+        if (active) void load();
+    }, [active, load]);
+
+    const run = (action: () => Promise<void>) => void action().catch((reason) => message.error(reason instanceof Error ? reason.message : t("config.canvasFolder.failed")));
+    const statusText = status === "needs-permission" ? t("config.canvasFolder.needsPermission") : status === "saving" ? t("config.canvasFolder.saving") : status === "error" ? t("config.canvasFolder.error", { message: error }) : lastSavedAt ? t("config.canvasFolder.savedAt", { time: new Date(lastSavedAt).toLocaleTimeString() }) : t("config.canvasFolder.enabled");
+
+    return (
+        <section className="rounded-lg border border-stone-200 p-4 dark:border-stone-800">
+            <div className="flex items-center gap-2 text-sm font-semibold">
+                <FolderOpen className="size-4" />
+                {t("config.canvasFolder.title")}
+            </div>
+            <div className="mt-1 text-xs text-stone-500">{t("config.canvasFolder.description")}</div>
+            {status === "unsupported" ? (
+                <Alert className="mt-4" type="warning" showIcon message={t("config.canvasFolder.unsupported")} />
+            ) : (
+                <>
+                    {folderName ? (
+                        <div className="mt-4 text-sm">
+                            <span className="font-medium">{folderName}</span>
+                            <span className={`ml-3 text-xs ${status === "error" || status === "needs-permission" ? "text-red-500" : "text-stone-500"}`}>{statusText}</span>
+                        </div>
+                    ) : null}
+                    <div className="mt-4 flex flex-wrap gap-2">
+                        <Button type={folderName ? "default" : "primary"} icon={<FolderOpen className="size-4" />} onClick={() => run(pickFolder)}>
+                            {t(folderName ? "config.canvasFolder.change" : "config.canvasFolder.pick")}
+                        </Button>
+                        {folderName ? (
+                            <>
+                                <Button icon={<Save className="size-4" />} loading={status === "saving"} onClick={() => run(saveNow)}>
+                                    {t("config.canvasFolder.saveNow")}
+                                </Button>
+                                <Button onClick={() => run(disable)}>{t("config.canvasFolder.disable")}</Button>
+                            </>
+                        ) : null}
+                    </div>
+                </>
+            )}
+        </section>
     );
 }
 

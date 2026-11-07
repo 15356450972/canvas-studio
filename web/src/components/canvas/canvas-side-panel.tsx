@@ -1,10 +1,11 @@
 import { memo, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
-import { App, Empty, Input, Popconfirm, Select, Spin, Tag } from "antd";
+import { App, Dropdown, Empty, Form, Input, Modal, Popconfirm, Select, Spin, Tag } from "antd";
 import { useQuery } from "@tanstack/react-query";
-import { BookOpen, Check, ChevronRight, Download, Eye, FileText, Image as ImageIcon, ListChecks, Music2, Plus, Search, Settings2, Square, Trash2, Type, Video } from "lucide-react";
+import { BookOpen, Check, ChevronRight, Download, Eye, FileText, FolderInput, FolderPlus, Image as ImageIcon, ListChecks, MoreHorizontal, Music2, PencilLine, Plus, Search, Settings2, Square, Trash2, Type, Video } from "lucide-react";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
 
+import { AssetGroupSelect, useAssetGroups } from "@/components/assets/asset-group-select";
 import { canvasThemes, type CanvasTheme } from "@/lib/canvas-theme";
 import { exportCanvasNodes } from "@/lib/canvas/canvas-export";
 import { getNodeDefinition } from "@/lib/canvas/node-registry";
@@ -13,7 +14,7 @@ import { PromptDetailDialog } from "@/pages/prompts/components/prompt-detail-dia
 import { fetchSourcePrompts, type Prompt } from "@/services/api/prompts";
 import { uploadMediaFile } from "@/services/file-storage";
 import { uploadImage } from "@/services/image-storage";
-import { useAssetStore, type Asset, type AssetKind } from "@/stores/use-asset-store";
+import { matchesAssetGroup, useAssetStore, type Asset, type AssetKind } from "@/stores/use-asset-store";
 import { usePromptSourceStore } from "@/stores/use-prompt-source-store";
 import { CANVAS_SIDE_PANEL_MAX_WIDTH, CANVAS_SIDE_PANEL_MIN_WIDTH, CANVAS_SIDE_PANEL_MOTION_MS, useCanvasSidePanelStore } from "@/stores/use-canvas-side-panel-store";
 import { useThemeStore } from "@/stores/use-theme-store";
@@ -318,8 +319,15 @@ const CanvasAssetsTab = memo(function CanvasAssetsTab({ onInsert, theme }: { onI
     const assets = useAssetStore((state) => state.assets);
     const addAsset = useAssetStore((state) => state.addAsset);
     const removeAsset = useAssetStore((state) => state.removeAsset);
+    const addGroup = useAssetStore((state) => state.addGroup);
+    const renameGroup = useAssetStore((state) => state.renameGroup);
+    const removeGroup = useAssetStore((state) => state.removeGroup);
     const [keyword, setKeyword] = useState("");
     const [tagFilter, setTagFilter] = useState<string>("all");
+    const [groupFilter, setGroupFilter] = useState<string>();
+    const [groupEditor, setGroupEditor] = useState<{ name: string; original?: string } | null>(null);
+    const [groupError, setGroupError] = useState("");
+    const [deletingGroup, setDeletingGroup] = useState<string>();
     const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
     const [uploading, setUploading] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
@@ -328,10 +336,26 @@ const CanvasAssetsTab = memo(function CanvasAssetsTab({ onInsert, theme }: { onI
 
     const filtered = useMemo(() => {
         const query = keyword.trim().toLowerCase();
-        return assets.filter((asset) => (tagFilter === "all" || (asset.tags || []).includes(tagFilter)) && (!query || [asset.title, ...(asset.tags || [])].join(" ").toLowerCase().includes(query)));
-    }, [assets, keyword, tagFilter]);
+        return assets.filter((asset) => matchesAssetGroup(asset, groupFilter) && (tagFilter === "all" || (asset.tags || []).includes(tagFilter)) && (!query || [asset.title, ...(asset.tags || [])].join(" ").toLowerCase().includes(query)));
+    }, [assets, keyword, tagFilter, groupFilter]);
 
     const groups = useMemo(() => ASSET_GROUPS.map((group) => ({ ...group, items: filtered.filter((asset) => asset.kind === group.kind) })).filter((group) => group.items.length > 0), [filtered]);
+
+    const saveGroup = () => {
+        if (!groupEditor) return;
+        const name = groupEditor.name.trim();
+        if (!name) {
+            setGroupError(t("assets.group.nameRequired"));
+            return;
+        }
+        if (!(groupEditor.original ? renameGroup(groupEditor.original, name) : addGroup(name))) {
+            setGroupError(t("assets.group.nameExists"));
+            return;
+        }
+        setGroupFilter(name);
+        setGroupEditor(null);
+        message.success(t(groupEditor.original ? "assets.group.renamed" : "assets.group.created"));
+    };
 
     const handleFiles = async (fileList: FileList | null) => {
         const files = Array.from(fileList || []);
@@ -343,11 +367,11 @@ const CanvasAssetsTab = memo(function CanvasAssetsTab({ onInsert, theme }: { onI
             for (const file of files) {
                 if (file.type.startsWith("image/")) {
                     const image = await uploadImage(file);
-                    addAsset({ kind: "image", title: file.name || t("assets.kinds.image"), coverUrl: image.url, tags: [], data: { dataUrl: image.url, storageKey: image.storageKey, width: image.width, height: image.height, bytes: image.bytes, mimeType: image.mimeType } });
+                    addAsset({ kind: "image", title: file.name || t("assets.kinds.image"), coverUrl: image.url, tags: [], group: groupFilter || undefined, data: { dataUrl: image.url, storageKey: image.storageKey, width: image.width, height: image.height, bytes: image.bytes, mimeType: image.mimeType } });
                     added += 1;
                 } else if (file.type.startsWith("video/")) {
                     const media = await uploadMediaFile(file, "video");
-                    addAsset({ kind: "video", title: file.name || t("assets.kinds.video"), coverUrl: "", tags: [], data: { url: media.url, storageKey: media.storageKey, width: media.width || 0, height: media.height || 0, bytes: media.bytes, mimeType: media.mimeType } });
+                    addAsset({ kind: "video", title: file.name || t("assets.kinds.video"), coverUrl: "", tags: [], group: groupFilter || undefined, data: { url: media.url, storageKey: media.storageKey, width: media.width || 0, height: media.height || 0, bytes: media.bytes, mimeType: media.mimeType } });
                     added += 1;
                 }
             }
@@ -378,6 +402,23 @@ const CanvasAssetsTab = memo(function CanvasAssetsTab({ onInsert, theme }: { onI
                     {t("canvas.sidePanel.add")}
                 </button>
                 <input ref={fileInputRef} type="file" accept="image/*,video/*" multiple className="hidden" onChange={(e) => void handleFiles(e.target.files)} />
+            </div>
+            <div className="flex items-center gap-1 px-3 pb-2.5">
+                <AssetGroupSelect className="min-w-0 flex-1" size="small" allowAll value={groupFilter} onChange={setGroupFilter} disabled={uploading} />
+                <button type="button" disabled={uploading} onClick={() => { setGroupEditor({ name: "" }); setGroupError(""); }} className="flex h-7 shrink-0 items-center gap-1 rounded-md px-1 text-xs opacity-75 transition hover:bg-black/5 hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-white/10" style={{ color: theme.node.text }} aria-label={t("assets.group.create")}>
+                    <FolderPlus className="size-3.5" />
+                    <span>{t("assets.group.create")}</span>
+                </button>
+                {groupFilter ? (
+                    <Dropdown trigger={["click"]} disabled={uploading} menu={{ items: [
+                        { key: "rename", icon: <PencilLine className="size-3.5" />, label: t("assets.group.rename"), onClick: () => { setGroupEditor({ name: groupFilter, original: groupFilter }); setGroupError(""); } },
+                        { key: "delete", icon: <Trash2 className="size-3.5" />, label: t("assets.group.delete"), danger: true, onClick: () => setDeletingGroup(groupFilter) },
+                    ] }}>
+                        <button type="button" disabled={uploading} className="grid size-7 shrink-0 place-items-center rounded-md opacity-65 transition-opacity hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-40" style={{ color: theme.node.text }} aria-label={t("assets.group.manage")} title={t("assets.group.manage")}>
+                            <MoreHorizontal className="size-3.5" />
+                        </button>
+                    </Dropdown>
+                ) : null}
             </div>
             {allTags.length ? (
                 <div className="flex flex-wrap gap-1.5 px-3 pb-2">
@@ -423,12 +464,32 @@ const CanvasAssetsTab = memo(function CanvasAssetsTab({ onInsert, theme }: { onI
                     <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t("canvas.sidePanel.noAssets")} className="pt-16" />
                 )}
             </div>
+            <Modal title={t(groupEditor?.original ? "assets.group.rename" : "assets.group.create")} open={Boolean(groupEditor)} onCancel={() => setGroupEditor(null)} onOk={saveGroup} okText={t("common.save")} cancelText={t("common.cancel")} destroyOnHidden>
+                <Form layout="vertical" requiredMark={false}>
+                    <Form.Item label={t("assets.group.name")} validateStatus={groupError ? "error" : undefined} help={groupError || undefined}>
+                        <Input autoFocus value={groupEditor?.name || ""} placeholder={t("assets.group.namePlaceholder")} onChange={(event) => { setGroupEditor((current) => current ? { ...current, name: event.target.value } : null); setGroupError(""); }} onPressEnter={saveGroup} />
+                    </Form.Item>
+                </Form>
+            </Modal>
+            <Modal title={t("assets.group.delete")} open={Boolean(deletingGroup)} onCancel={() => setDeletingGroup(undefined)} onOk={() => {
+                if (!deletingGroup) return;
+                removeGroup(deletingGroup);
+                if (groupFilter === deletingGroup) setGroupFilter("");
+                setDeletingGroup(undefined);
+                message.success(t("assets.group.deleted"));
+            }} okText={t("common.delete")} okButtonProps={{ danger: true }} cancelText={t("common.cancel")}>
+                {t("assets.group.deleteConfirm", { name: deletingGroup })}
+            </Modal>
         </div>
     );
 });
 
 function AssetCard({ asset, theme, onInsert, onRemove }: { asset: Asset; theme: CanvasTheme; onInsert: () => void; onRemove: () => void }) {
+    const { message } = App.useApp();
     const { t } = useTranslation();
+    const groups = useAssetGroups();
+    const moveAssets = useAssetStore((state) => state.moveAssets);
+    const currentGroup = asset.group?.trim() || "";
     return (
         <div
             draggable
@@ -441,7 +502,23 @@ function AssetCard({ asset, theme, onInsert, onRemove }: { asset: Asset; theme: 
             style={{ borderColor: theme.node.stroke, background: theme.node.panel }}
         >
             <AssetCover asset={asset} />
-            <div className="absolute inset-0 flex items-center justify-center gap-2.5 opacity-0 transition duration-200 group-hover:opacity-100">
+            <Dropdown trigger={["click"]} placement="bottomRight" menu={{
+                selectedKeys: [currentGroup ? `group:${currentGroup}` : "ungrouped"],
+                items: [{ type: "group", label: t("assets.group.move"), children: [
+                    { key: "ungrouped", label: t("assets.group.ungrouped"), disabled: !currentGroup },
+                    ...groups.map((group) => ({ key: `group:${group}`, label: group, disabled: currentGroup === group })),
+                ] }],
+                onClick: ({ key, domEvent }) => {
+                    domEvent.stopPropagation();
+                    moveAssets([asset.id], key === "ungrouped" ? undefined : key.slice(6));
+                    message.success(t("assets.group.moved", { count: 1 }));
+                },
+            }}>
+                <button type="button" draggable={false} onPointerDown={(event) => event.stopPropagation()} onDragStart={(event) => { event.preventDefault(); event.stopPropagation(); }} className="absolute right-1 top-1 z-10 grid size-7 place-items-center rounded-md opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100" style={{ color: theme.node.text }} aria-label={t("assets.group.move")} title={t("assets.group.move")}>
+                    <FolderInput className="size-3.5" />
+                </button>
+            </Dropdown>
+            <div className="absolute inset-0 flex items-center justify-center gap-2.5 opacity-0 transition duration-200 group-hover:opacity-100 group-focus-within:opacity-100">
                 <button
                     type="button"
                     onClick={onInsert}

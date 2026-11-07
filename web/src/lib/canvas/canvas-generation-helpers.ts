@@ -168,11 +168,27 @@ export function hasResumableVideoTask(node: CanvasNodeData) {
     return node.type === CanvasNodeType.Video && Boolean(node.metadata?.videoTaskId) && !node.metadata?.content;
 }
 
+/** 生图任务已经拿到 task id（异步渠道）时，刷新后可以按 id 继续等结果。 */
+export function hasResumableImageTask(node: CanvasNodeData) {
+    if (node.type !== CanvasNodeType.Image || node.metadata?.status !== "loading") return false;
+    const images = node.metadata.images || [];
+    return images.length ? images.some((image) => image.status === "loading" && image.taskId) : Boolean(node.metadata.imageTaskId && !node.metadata.content);
+}
+
 export function resetInterruptedGeneration(nodes: CanvasNodeData[]) {
     return nodes.map((node) =>
         node.metadata?.status === "loading"
             ? hasResumableVideoTask(node)
                 ? node
+                : hasResumableImageTask(node)
+                  ? {
+                        ...node,
+                        metadata: {
+                            ...node.metadata,
+                            // 没拿到 task id 的那几张没法续，单独标中断；有 id 的保持 loading 等恢复轮询。
+                            images: node.metadata.images?.map((image) => (image.status === "loading" && !image.taskId ? { ...image, status: "error" as const, errorDetails: i18n.t("canvas.generation.interrupted") } : image)),
+                        },
+                    }
                 : {
                       ...node,
                       metadata: {

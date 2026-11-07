@@ -1,4 +1,4 @@
-import { withLocalProxy } from "@/stores/use-config-store";
+import { OIIOII_HOST, withLocalProxy } from "@/stores/use-config-store";
 
 const EPHEMERAL_MEDIA_HOST = /(\.volces\.com|\.volcengine\.com)$/i;
 
@@ -23,9 +23,28 @@ export function isEphemeralMediaUrl(value?: string) {
     }
 }
 
+export function isOiioiiMediaUrl(value?: string) {
+    const url = isPublicHttpUrl(value);
+    if (!url) return "";
+    try {
+        return new URL(url).hostname === OIIOII_HOST ? url : "";
+    } catch {
+        return "";
+    }
+}
+
+// uguu 垫图链接约 3 小时过期，不能当稳定地址复用，用时重新上传。
+function isUguuUrl(url: string) {
+    try {
+        return /(^|\.)uguu\.se$/i.test(new URL(url).hostname);
+    } catch {
+        return false;
+    }
+}
+
 export function isStablePublicUrl(value?: string) {
     const url = isPublicHttpUrl(value);
-    return url && !isEphemeralMediaUrl(url) ? url : "";
+    return url && !isEphemeralMediaUrl(url) && !isOiioiiMediaUrl(url) && !isUguuUrl(url) ? url : "";
 }
 
 export function sameOriginMediaUrl(value: string) {
