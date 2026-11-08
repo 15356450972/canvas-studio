@@ -1,9 +1,9 @@
 ---
 name: open-canvas
-description: 打开 Infinite Canvas 在线或本地画布，并自动连接本地 Canvas Agent。用户要求打开、启动、进入或使用 Infinite Canvas 画布时使用。
+description: 打开 Canvas Studio 在线或本地画布，并自动连接本地 Canvas Agent。用户要求打开、启动、进入或使用 Canvas Studio 画布时使用。
 ---
 
-# Open Infinite Canvas
+# Open Canvas Studio
 
 默认打开在线版。只有用户明确要求使用本地项目时，才启动本地前端。
 
@@ -25,7 +25,7 @@ https://canvas.best/canvas?mode=new#agentUrl=<Local URL>&agentToken=<Connect tok
 
 ## 本地版
 
-1. 在 Infinite Canvas 项目中启动前端，并使用 Vite 输出的 `Local` 地址：
+1. 在 Canvas Studio 项目中启动前端，并使用 Vite 输出的 `Local` 地址：
 
 ```bash
 cd web

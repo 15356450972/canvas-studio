@@ -1,4 +1,4 @@
-# Infinite Canvas Documentation Index
+# Canvas Studio Documentation Index
 
 ## Overview
 

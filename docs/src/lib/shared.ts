@@ -1,14 +1,14 @@
 export const appNames = {
-  en: 'Infinite Canvas',
-  'zh-CN': '无限画布',
+  en: 'Canvas Studio',
+  'zh-CN': 'Canvas Studio',
 };
 export const docsRoute = '/docs';
 export const docsContentRoute = '/llms.mdx/docs';
 
 // fill this with your actual GitHub info, for example:
 export const gitConfig = {
-  user: 'basketikun',
-  repo: 'infinite-canvas',
+  user: '15356450972',
+  repo: 'canvas-studio',
   branch: 'main',
   docsContentDir: 'docs/content/docs',
 };
