@@ -1,7 +1,7 @@
 import { memo, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { App, Dropdown, Empty, Form, Input, Modal, Popconfirm, Select, Spin, Tag } from "antd";
 import { useQuery } from "@tanstack/react-query";
-import { BookOpen, Check, ChevronRight, Download, Eye, FileText, FolderInput, FolderPlus, Image as ImageIcon, ListChecks, MoreHorizontal, Music2, PencilLine, Plus, Search, Settings2, Square, Trash2, Type, Video } from "lucide-react";
+import { BookOpen, Check, ChevronRight, Download, Eye, FileText, FolderInput, FolderPlus, Image as ImageIcon, LayoutGrid, ListChecks, MoreHorizontal, Music2, PencilLine, Plus, Search, Settings2, Square, Trash2, Type, Video } from "lucide-react";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
 
@@ -33,6 +33,7 @@ type Props = {
     onFocusNode: (nodeId: string) => void;
     onPreviewNode: (nodeId: string) => void;
     onInsertAsset: (payload: InsertAssetPayload) => void;
+    onInsertAssets: (payloads: InsertAssetPayload[]) => Promise<void>;
 };
 
 const NODE_TYPE_ICON: Record<string, typeof Square> = {
@@ -51,7 +52,7 @@ const STATUS_COLOR: Record<string, string> = {
     idle: "transparent",
 };
 
-export function CanvasSidePanel({ nodes, selectedNodeIds, onFocusNode, onPreviewNode, onInsertAsset }: Props) {
+export function CanvasSidePanel({ nodes, selectedNodeIds, onFocusNode, onPreviewNode, onInsertAsset, onInsertAssets }: Props) {
     const { t } = useTranslation();
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
     const [tab, setTab] = useState<PanelTab>("canvas");
@@ -109,7 +110,7 @@ export function CanvasSidePanel({ nodes, selectedNodeIds, onFocusNode, onPreview
                     {tab === "canvas" ? (
                         <CanvasNodesTab nodes={nodes} selectedNodeIds={selectedNodeIds} onFocusNode={onFocusNode} onPreviewNode={onPreviewNode} theme={theme} />
                     ) : tab === "assets" ? (
-                        <CanvasAssetsTab onInsert={onInsertAsset} theme={theme} />
+                        <CanvasAssetsTab onInsert={onInsertAsset} onInsertMany={onInsertAssets} theme={theme} />
                     ) : (
                         <CanvasPromptsTab onInsert={onInsertAsset} theme={theme} />
                     )}
@@ -313,7 +314,7 @@ export function buildInsertPayload(asset: Asset): InsertAssetPayload {
     return { kind: "image", dataUrl: asset.data.dataUrl, storageKey: asset.data.storageKey, title: asset.title };
 }
 
-const CanvasAssetsTab = memo(function CanvasAssetsTab({ onInsert, theme }: { onInsert: (payload: InsertAssetPayload) => void; theme: CanvasTheme }) {
+const CanvasAssetsTab = memo(function CanvasAssetsTab({ onInsert, onInsertMany, theme }: { onInsert: (payload: InsertAssetPayload) => void; onInsertMany: (payloads: InsertAssetPayload[]) => Promise<void>; theme: CanvasTheme }) {
     const { message } = App.useApp();
     const { t } = useTranslation();
     const assets = useAssetStore((state) => state.assets);
@@ -330,6 +331,7 @@ const CanvasAssetsTab = memo(function CanvasAssetsTab({ onInsert, theme }: { onI
     const [deletingGroup, setDeletingGroup] = useState<string>();
     const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
     const [uploading, setUploading] = useState(false);
+    const [importing, setImporting] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     const allTags = useMemo(() => Array.from(new Set(assets.flatMap((asset) => asset.tags || []))).slice(0, 20), [assets]);
@@ -340,6 +342,24 @@ const CanvasAssetsTab = memo(function CanvasAssetsTab({ onInsert, theme }: { onI
     }, [assets, keyword, tagFilter, groupFilter]);
 
     const groups = useMemo(() => ASSET_GROUPS.map((group) => ({ ...group, items: filtered.filter((asset) => asset.kind === group.kind) })).filter((group) => group.items.length > 0), [filtered]);
+    const importableCount = groups.reduce((sum, group) => sum + group.items.length, 0);
+
+    const importToCanvas = async () => {
+        const payloads = groups.flatMap((group) => group.items.map(buildInsertPayload));
+        if (!payloads.length || importing) return;
+        setImporting(true);
+        const hide = message.loading(t("canvas.sidePanel.importingToCanvas"), 0);
+        try {
+            await onInsertMany(payloads);
+            message.success(t("canvas.sidePanel.importedToCanvas", { count: payloads.length }));
+        } catch (error) {
+            console.error(error);
+            message.error(error instanceof Error ? error.message : t("canvas.sidePanel.importToCanvasFailed"));
+        } finally {
+            hide();
+            setImporting(false);
+        }
+    };
 
     const saveGroup = () => {
         if (!groupEditor) return;
@@ -403,11 +423,17 @@ const CanvasAssetsTab = memo(function CanvasAssetsTab({ onInsert, theme }: { onI
                 </button>
                 <input ref={fileInputRef} type="file" accept="image/*,video/*" multiple className="hidden" onChange={(e) => void handleFiles(e.target.files)} />
             </div>
-            <div className="flex items-center gap-1 px-3 pb-2.5">
-                <AssetGroupSelect className="min-w-0 flex-1" size="small" allowAll value={groupFilter} onChange={setGroupFilter} disabled={uploading} />
-                <button type="button" disabled={uploading} onClick={() => { setGroupEditor({ name: "" }); setGroupError(""); }} className="flex h-7 shrink-0 items-center gap-1 rounded-md px-1 text-xs opacity-75 transition hover:bg-black/5 hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-white/10" style={{ color: theme.node.text }} aria-label={t("assets.group.create")}>
+            <div className="@container flex items-center gap-1 px-3 pb-2.5">
+                <AssetGroupSelect className="min-w-20 flex-1" size="small" allowAll value={groupFilter} onChange={setGroupFilter} disabled={uploading} />
+                <Popconfirm title={t("canvas.sidePanel.importToCanvasConfirm", { count: importableCount })} okText={t("canvas.sidePanel.importToCanvas")} cancelText={t("common.cancel")} disabled={uploading || importing || !importableCount} onConfirm={() => void importToCanvas()}>
+                    <button type="button" disabled={uploading || importing || !importableCount} className="flex h-7 shrink-0 items-center gap-1 rounded-md px-1 text-xs opacity-75 transition hover:bg-black/5 hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-white/10" style={{ color: theme.node.text }} aria-label={t("canvas.sidePanel.importToCanvas")} title={t("canvas.sidePanel.importToCanvasHint")}>
+                        <LayoutGrid className="size-3.5" />
+                        <span className="@max-[300px]:hidden">{t("canvas.sidePanel.importToCanvas")}</span>
+                    </button>
+                </Popconfirm>
+                <button type="button" disabled={uploading} onClick={() => { setGroupEditor({ name: "" }); setGroupError(""); }} className="flex h-7 shrink-0 items-center gap-1 rounded-md px-1 text-xs opacity-75 transition hover:bg-black/5 hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-white/10" style={{ color: theme.node.text }} aria-label={t("assets.group.create")} title={t("assets.group.create")}>
                     <FolderPlus className="size-3.5" />
-                    <span>{t("assets.group.create")}</span>
+                    <span className="@max-[300px]:hidden">{t("assets.group.create")}</span>
                 </button>
                 {groupFilter ? (
                     <Dropdown trigger={["click"]} disabled={uploading} menu={{ items: [

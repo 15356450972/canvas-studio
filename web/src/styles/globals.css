@@ -1,6 +1,8 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
+/* 显式声明源码路径（相对本 CSS），避免 Electron 从 desktop/ 拉起 Vite 时 cwd 不对导致工具类扫空。 */
+@source "../**/*.{js,ts,jsx,tsx}";
 @source "../../../node_modules/streamdown/dist/*.js";
 
 @custom-variant dark (&:is(.dark *));

@@ -1,9 +1,9 @@
 import { create } from "zustand";
-import { persist, type PersistStorage, type StorageValue } from "zustand/middleware";
+import { persist, type StorageValue } from "zustand/middleware";
 
 import { nanoid } from "nanoid";
 import i18n from "@/i18n";
-import { localForageStorage } from "@/lib/localforage-storage";
+import { createProtectedStorage, localForageStorage } from "@/lib/localforage-storage";
 import type { CanvasBackgroundMode } from "@/lib/canvas-theme";
 import { saveCanvasProjectsToFolder } from "@/stores/canvas/use-canvas-folder-store";
 import type { CanvasAssistantSession, CanvasConnection, CanvasNodeData, ViewportTransform } from "@/types/canvas";
@@ -43,29 +43,23 @@ type CanvasStore = {
 const initialViewport: ViewportTransform = { x: 0, y: 0, k: 1 };
 const CANVAS_STORE_KEY = "infinite-canvas:canvas_store";
 type PersistedCanvasState = Pick<CanvasStore, "projects" | "deletedProjects">;
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let queuedPersistState: PersistedCanvasState | null = null;
 
-const canvasStorage: PersistStorage<CanvasStore> = {
-    getItem: async (name) => {
-        const value = await localForageStorage.getItem(name);
-        if (!value) return null;
-        const parsed = JSON.parse(value) as StorageValue<CanvasStore>;
-        queuedPersistState = parsed.state as PersistedCanvasState;
-        return parsed;
+const canvasStorage = createProtectedStorage<CanvasStore>(CANVAS_STORE_KEY, {
+    hydrate: (value) => {
+        if (!Array.isArray(value.state.projects) || (value.state.deletedProjects !== undefined && !Array.isArray(value.state.deletedProjects))) throw new Error("画布本地数据格式错误，已阻止覆盖");
+        return value;
     },
-    setItem: (name, value) => {
+    write: async (name, value) => {
         const nextState = value.state as PersistedCanvasState;
         if (queuedPersistState && queuedPersistState.projects === nextState.projects && queuedPersistState.deletedProjects === nextState.deletedProjects) return;
+        await localForageStorage.setItem(name, JSON.stringify(value));
         queuedPersistState = nextState;
-        if (saveTimer) clearTimeout(saveTimer);
-        saveTimer = setTimeout(() => {
-            saveTimer = null;
-            void Promise.resolve(localForageStorage.setItem(name, JSON.stringify(value))).then(() => saveCanvasProjectsToFolder(nextState.projects));
-        }, 400);
+        saveCanvasProjectsToFolder(nextState.projects);
     },
-    removeItem: (name) => localForageStorage.removeItem(name),
-};
+});
+
+export const flushCanvasStorage = () => canvasStorage.flush();
 
 export const useCanvasStore = create<CanvasStore>()(
     persist(
@@ -74,6 +68,7 @@ export const useCanvasStore = create<CanvasStore>()(
             projects: [],
             deletedProjects: [],
             createProject: (title = i18n.t("canvas.project.untitled")) => {
+                canvasStorage.requireReady();
                 const now = new Date().toISOString();
                 const id = nanoid();
                 const project: CanvasProject = {
@@ -93,6 +88,7 @@ export const useCanvasStore = create<CanvasStore>()(
                 return id;
             },
             importProject: (source) => {
+                canvasStorage.requireReady();
                 const now = new Date().toISOString();
                 const project: CanvasProject = {
                     id: nanoid(),
@@ -113,34 +109,50 @@ export const useCanvasStore = create<CanvasStore>()(
             openProject: (id) => {
                 return get().projects.find((item) => item.id === id) || null;
             },
-            renameProject: (id, title) =>
+            renameProject: (id, title) => {
+                canvasStorage.requireReady();
                 set((state) => ({
                     projects: state.projects.map((project) => (project.id === id ? { ...project, title: title.trim() || project.title, updatedAt: new Date().toISOString() } : project)),
-                })),
-            deleteProjects: (ids) =>
+                }));
+            },
+            deleteProjects: (ids) => {
+                canvasStorage.requireReady();
                 set((state) => {
                     const now = new Date().toISOString();
                     const removing = new Set(ids);
                     const projects = state.projects.filter((project) => !removing.has(project.id));
                     const deletedProjects = [...state.deletedProjects.filter((item) => !removing.has(item.id)), ...ids.map((id) => ({ id, deletedAt: now }))];
                     return { projects, deletedProjects };
-                }),
-            replaceProjects: (projects, deletedProjects = []) => set({ projects, deletedProjects }),
-            updateProject: (id, patch) =>
+                });
+            },
+            replaceProjects: (projects, deletedProjects = []) => {
+                canvasStorage.requireReady();
+                set({ projects, deletedProjects });
+            },
+            updateProject: (id, patch) => {
+                canvasStorage.requireReady();
                 set((state) => ({
                     projects: state.projects.map((project) => (project.id === id ? { ...project, ...patch, updatedAt: new Date().toISOString() } : project)),
-                })),
+                }));
+            },
         }),
         {
             name: CANVAS_STORE_KEY,
-            storage: canvasStorage,
+            storage: canvasStorage.storage,
             partialize: (state) =>
                 ({
                     projects: state.projects,
                     deletedProjects: state.deletedProjects,
                 }) as StorageValue<CanvasStore>["state"],
-            onRehydrateStorage: () => () => {
-                useCanvasStore.setState({ hydrated: true });
+            onRehydrateStorage: (state) => {
+                canvasStorage.beginHydration();
+                queuedPersistState = null;
+                if (state.hydrated) useCanvasStore.setState({ hydrated: false });
+                return (_state, error) => {
+                    if (error) return canvasStorage.finishHydration(error);
+                    useCanvasStore.setState({ hydrated: true });
+                    canvasStorage.finishHydration();
+                };
             },
         },
     ),

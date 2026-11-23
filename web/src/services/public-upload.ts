@@ -1,10 +1,14 @@
 import axios from "axios";
+import dayjs from "dayjs";
 
 import i18n from "@/i18n";
 import { fetchableMediaUrl, isEphemeralMediaUrl, isStablePublicUrl } from "@/lib/media-url";
 import { getMediaBlob } from "@/services/file-storage";
 import { getImageBlob, uploadImage, type UploadedImage } from "@/services/image-storage";
 import { withLocalProxy } from "@/stores/use-config-store";
+import { retryPublicUpload } from "@/services/public-upload-retry";
+import { safeUploadFileName } from "@/services/public-upload-name";
+import { saveGeneratedImageToFolder } from "@/stores/use-image-folder-store";
 
 const UGUU_UPLOAD = "https://uguu.se/upload";
 const DEV_UGUU_UPLOAD = "/__uguu/upload";
@@ -39,28 +43,9 @@ function uguuUploadUrl() {
     return DEV_UGUU_UPLOAD;
 }
 
+/** 文件名会原样进入 multipart，非 ASCII 名会让 uguu 返回 500，统一转成安全名。 */
 function fileName(source: PublicUploadSource, blob: Blob) {
-    const raw = (source.name || "").trim().split(/[/\\]/).pop() || "";
-    if (raw && /\.[a-z0-9]+$/i.test(raw)) return raw;
-    const type = (source.type || blob.type || "").toLowerCase();
-    const ext = type.includes("png")
-        ? "png"
-        : type.includes("jpeg") || type.includes("jpg")
-          ? "jpg"
-          : type.includes("webp")
-            ? "webp"
-            : type.includes("gif")
-              ? "gif"
-              : type.includes("wav")
-                ? "wav"
-                : type.includes("mp3") || type.includes("mpeg")
-                  ? "mp3"
-                  : type.includes("mp4")
-                    ? "mp4"
-                    : type.includes("webm")
-                      ? "webm"
-                      : "bin";
-    return `${raw || "file"}.${ext}`;
+    return safeUploadFileName(source.name, source.type || blob.type);
 }
 
 async function loadBlob(source: PublicUploadSource, signal?: AbortSignal) {
@@ -82,9 +67,20 @@ export async function uploadPublicFile(blob: Blob, name: string, options?: Uploa
     const form = new FormData();
     form.append("files[]", blob, name || "file.bin");
     try {
-        const { data } = await axios.post<UguuUploadResponse>(uguuUploadUrl(), form, { signal: options?.signal });
+        const { data } = await retryPublicUpload(
+            async () => {
+                const response = await axios.post<UguuUploadResponse>(uguuUploadUrl(), form, { signal: options?.signal });
+                if (!response.data.success || !response.data.files?.[0]?.url) {
+                    const failure = new Error(response.data.description || apiText("publicUploadFailed", { message: "" }));
+                    if (/\b(server error|bad gateway|service unavailable|gateway timeout)\b/i.test(failure.message)) Object.assign(failure, { code: 503 });
+                    throw failure;
+                }
+                return response;
+            },
+            { delay: (ms) => new Promise<void>((resolve) => window.setTimeout(resolve, ms)) },
+        );
         const url = data.files?.[0]?.url;
-        if (!data.success || !url) throw new Error(data.description || apiText("publicUploadFailed", { message: "" }));
+        if (!url) throw new Error(data.description || apiText("publicUploadFailed", { message: "" }));
         return url;
     } catch (error) {
         if (axios.isCancel(error) || (error instanceof DOMException && error.name === "AbortError")) throw error;
@@ -109,7 +105,10 @@ export async function resolvePublicHttpUrls(sources: PublicUploadSource[], optio
     return Promise.all(sources.map((source) => resolvePublicHttpUrl(source, options)));
 }
 
-/** 生成结果只落本地，不再预先上传公网。 */
-export async function persistGeneratedImage(input: string | Blob, options?: UploadOptions): Promise<UploadedImage> {
-    return uploadImage(input, options);
+/** 生成结果只落本地，不再预先上传公网；桌面应用设置了保存文件夹时再另存一份原文件，name 为文件名（不含扩展名）。 */
+export async function persistGeneratedImage(input: string | Blob, options?: UploadOptions & { name?: string }): Promise<UploadedImage> {
+    const stored = await uploadImage(input, options);
+    const blob = stored.storageKey ? await getImageBlob(stored.storageKey) : null;
+    if (blob) void saveGeneratedImageToFolder(blob, options?.name || dayjs().format("YYYYMMDD-HHmmss"));
+    return stored;
 }

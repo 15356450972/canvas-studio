@@ -5,10 +5,11 @@ import { getMediaBlob, resolveMediaUrl, setMediaBlob } from "@/services/file-sto
 import { getImageBlob, resolveImageUrl, setImageBlob } from "@/services/image-storage";
 import { downloadWebdavFile, uploadWebdavFile, WEBDAV_MANIFEST_FILE_NAME } from "@/services/webdav-sync";
 import type { Asset } from "@/stores/use-asset-store";
-import { useAssetStore } from "@/stores/use-asset-store";
+import { flushAssetStorage, useAssetStore } from "@/stores/use-asset-store";
 import type { WebdavSyncConfig } from "@/stores/use-config-store";
 import type { CanvasDeletedProject, CanvasProject } from "@/stores/canvas/use-canvas-store";
-import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
+import { flushCanvasStorage, useCanvasStore } from "@/stores/canvas/use-canvas-store";
+import { useStorageStatusStore } from "@/stores/use-storage-status-store";
 
 type StoredLog = Record<string, unknown> & { id?: string };
 export type AppSyncDomainKey = "canvas" | "assets" | "image-workbench" | "video-workbench";
@@ -81,9 +82,15 @@ const videoLogStore = localforage.createInstance({ name: "infinite-canvas", stor
 type LogStore = typeof imageLogStore;
 const storageKeyPattern = /^(image|video|audio|file|video-reference|audio-reference):/;
 
+const CANVAS_STORE_KEY = "infinite-canvas:canvas_store";
+const ASSET_STORE_KEY = "infinite-canvas:asset_store";
+
 export async function syncAppDataToWebdav(config: WebdavSyncConfig, onProgress?: AppSyncProgress): Promise<AppSyncResult> {
     emitProgress(onProgress, { stage: "等待本地数据加载" });
-    await Promise.all([waitForHydration(useCanvasStore), waitForHydration(useAssetStore)]);
+    await Promise.all([waitForHydration(useCanvasStore, CANVAS_STORE_KEY), waitForHydration(useAssetStore, ASSET_STORE_KEY)]);
+    await Promise.all([flushCanvasStorage(), flushAssetStorage()]);
+    const writeIssues = Object.values(useStorageStatusStore.getState().issues).filter((issue) => issue.operation === "write" && [CANVAS_STORE_KEY, ASSET_STORE_KEY].includes(issue.key));
+    if (writeIssues.length) throw new Error(`本地数据尚未成功保存，已阻止同步以避免覆盖：${writeIssues.map((issue) => issue.key).join("、")}`);
 
     const [canvas, assets, imageLogs, videoLogs] = await Promise.all([
         syncDomain<CanvasDomainData>(config, onProgress, {
@@ -390,14 +397,26 @@ function fileExtension(mimeType: string, storageKey: string) {
     return storageKey.startsWith("image:") ? "png" : "bin";
 }
 
-function waitForHydration<T extends { hydrated: boolean }>(store: { getState: () => T; subscribe: (listener: (state: T) => void) => () => void }) {
+function waitForHydration<T extends { hydrated: boolean }>(store: { getState: () => T; subscribe: (listener: (state: T) => void) => () => void }, key: string) {
+    const readIssue = () => Object.values(useStorageStatusStore.getState().issues).find((issue) => issue.key === key && issue.operation === "read" && issue.severity === "error");
     if (store.getState().hydrated) return Promise.resolve();
-    return new Promise<void>((resolve) => {
-        const unsubscribe = store.subscribe((state) => {
-            if (!state.hydrated) return;
-            unsubscribe();
-            resolve();
-        });
+    if (readIssue()) return Promise.reject(new Error(`本地数据读取失败，已停止同步：${key}`));
+    return new Promise<void>((resolve, reject) => {
+        let unsubscribeStore = () => {};
+        let unsubscribeStatus = () => {};
+        const finish = (error?: Error) => {
+            unsubscribeStore();
+            unsubscribeStatus();
+            if (error) reject(error);
+            else resolve();
+        };
+        const check = () => {
+            if (store.getState().hydrated) return finish();
+            if (readIssue()) finish(new Error(`本地数据读取失败，已停止同步：${key}`));
+        };
+        unsubscribeStore = store.subscribe(check);
+        unsubscribeStatus = useStorageStatusStore.subscribe(check);
+        check();
     });
 }
 

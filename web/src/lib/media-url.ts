@@ -1,3 +1,4 @@
+import { desktopMediaUrl, isDesktop } from "@/services/desktop";
 import { OIIOII_HOST, withLocalProxy } from "@/stores/use-config-store";
 
 const EPHEMERAL_MEDIA_HOST = /(\.volces\.com|\.volcengine\.com)$/i;
@@ -58,5 +59,7 @@ export function fetchableMediaUrl(value: string) {
     if (!value || value.startsWith("blob:") || value.startsWith("data:") || value.startsWith("/")) return value;
     const rewritten = sameOriginMediaUrl(value);
     if (rewritten !== value) return rewritten;
-    return withLocalProxy(value);
+    const proxied = withLocalProxy(value);
+    // 用户配置的本地代理优先；桌面应用里其余 http(s) 地址交给主进程下载。
+    return proxied === value && isDesktop && /^https?:\/\//i.test(value) ? desktopMediaUrl(value) : proxied;
 }

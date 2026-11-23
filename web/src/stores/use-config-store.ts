@@ -81,8 +81,18 @@ export const OIIOII_CHANNEL_ID = "oiioii";
 export const OIIOII_HOST = "64.83.9.159";
 export const OIIOII_BASE_URL = `http://${OIIOII_HOST}:18481`;
 export const NEWTAKE_CHANNEL_ID = "newtake";
-export const NEWTAKE_BASE_URL = "http://127.0.0.1:8765";
+/** 服务器部署版出片台（Nginx，自签名证书，SAN 只含该 IP）。 */
+export const NEWTAKE_BASE_URL = "https://64.81.113.214:8443";
+/** 旧版本默认的本机出片台；配置迁移与渠道识别都保留兼容。 */
+export const NEWTAKE_LEGACY_BASE_URL = "http://127.0.0.1:8765";
 export const NEWTAKE_MODEL = "wanx3.0";
+/** OpenAI-compatible /v1/models currently exposes the Wan 3.0 video model. */
+export const NEWTAKE_MODELS: Array<{ name: string; capability: ModelCapability }> = [{ name: NEWTAKE_MODEL, capability: "video" }];
+export const NEWTAKE_MAX_IMAGES = 10;
+export const NEWTAKE_MAX_AUDIOS = 5;
+export const NEWTAKE_MAX_DURATION_SECONDS = 20;
+export const NEWTAKE_RESOLUTIONS = ["480p", "720p"] as const;
+export const CONFIG_VERSION = 2;
 export const WANKE_CHANNEL_ID = "wanke";
 export const WANKE_BASE_URL = "https://api.wankeai.store";
 export const LOCAL_PROXY_PACKAGE = "@basketikun/canvas-proxy";
@@ -117,7 +127,7 @@ export const defaultConfig: AiConfig = {
             baseUrl: NEWTAKE_BASE_URL,
             apiKey: "",
             apiFormat: "openai",
-            models: [{ name: NEWTAKE_MODEL, capability: "video" }],
+            models: NEWTAKE_MODELS.map((model) => ({ ...model })),
         },
         {
             id: WANKE_CHANNEL_ID,
@@ -178,6 +188,7 @@ export const defaultWebdavSyncConfig: WebdavSyncConfig = {
 type ConfigStore = {
     config: AiConfig;
     webdav: WebdavSyncConfig;
+    configVersion: number;
     isConfigOpen: boolean;
     configTab: ConfigTabKey;
     shouldPromptContinue: boolean;
@@ -252,6 +263,7 @@ export const useConfigStore = create<ConfigStore>()(
         (set, get) => ({
             config: defaultConfig,
             webdav: defaultWebdavSyncConfig,
+            configVersion: CONFIG_VERSION,
             isConfigOpen: false,
             configTab: "channels",
             shouldPromptContinue: false,
@@ -415,20 +427,23 @@ export function ensureOiioiiChannel(channels: ModelChannel[]) {
 }
 
 export function isNewtakeChannel(channel: Pick<ModelChannel, "id" | "baseUrl">) {
-    return channel.id === NEWTAKE_CHANNEL_ID || normalizedBaseUrlKey(channel.baseUrl) === normalizedBaseUrlKey(NEWTAKE_BASE_URL);
+    if (channel.id === NEWTAKE_CHANNEL_ID) return true;
+    const key = normalizedBaseUrlKey(channel.baseUrl);
+    return key === normalizedBaseUrlKey(NEWTAKE_BASE_URL) || key === normalizedBaseUrlKey(NEWTAKE_LEGACY_BASE_URL);
 }
 
 /** 请求配置只带 baseUrl，按渠道列表反查是不是 Newtake 出片台。 */
 export function isNewtakeRequest(config: Pick<AiConfig, "baseUrl" | "channels">) {
     const key = normalizedBaseUrlKey(config.baseUrl);
-    return key === normalizedBaseUrlKey(NEWTAKE_BASE_URL) || (config.channels || []).some((channel) => channel.id === NEWTAKE_CHANNEL_ID && normalizedBaseUrlKey(channel.baseUrl) === key);
+    if (key === normalizedBaseUrlKey(NEWTAKE_BASE_URL) || key === normalizedBaseUrlKey(NEWTAKE_LEGACY_BASE_URL)) return true;
+    return (config.channels || []).some((channel) => isNewtakeChannel(channel) && normalizedBaseUrlKey(channel.baseUrl) === key);
 }
 
 export function ensureNewtakeChannel(channels: ModelChannel[]) {
     if (channels.some(isNewtakeChannel)) return channels;
     const index = channels.findIndex(isOiioiiChannel);
     const insertAt = index >= 0 ? index + 1 : 0;
-    const channel = createModelChannel({ id: NEWTAKE_CHANNEL_ID, name: i18n.t("config.channels.newtakeName"), baseUrl: NEWTAKE_BASE_URL, apiFormat: "openai", models: [{ name: NEWTAKE_MODEL, capability: "video" }] });
+    const channel = createModelChannel({ id: NEWTAKE_CHANNEL_ID, name: i18n.t("config.channels.newtakeName"), baseUrl: NEWTAKE_BASE_URL, apiFormat: "openai", models: NEWTAKE_MODELS.map((model) => ({ ...model })) });
     return [...channels.slice(0, insertAt), channel, ...channels.slice(insertAt)];
 }
 

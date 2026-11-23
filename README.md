@@ -107,6 +107,20 @@ bun install
 bun run dev
 ```
 
+### 桌面应用
+
+```bash
+cd desktop
+npm install
+npm run dev      # 构建前端并启动桌面应用
+npm run dev:hot  # 开发模式：前端改动热更新，无需重新构建（需先在 web 目录安装依赖）
+npm run pack     # 生成 dist/mac-arm64/Canvas Studio.app
+```
+
+`dev:hot` 仍以 `app://canvas-studio` 加载页面，与正常启动共用同一份数据；桌面应用只允许单实例，启动前请先退出已打开的 Canvas Studio。
+
+桌面应用的数据保存在系统的应用数据目录，与浏览器里的数据相互独立。
+
 ### Docker 运行
 
 ```bash

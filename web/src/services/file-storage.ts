@@ -10,7 +10,12 @@ const videoLogStore = localforage.createInstance({ name: "infinite-canvas", stor
 const objectUrls = new Map<string, string>();
 
 export async function uploadMediaFile(input: string | Blob, prefix = "file"): Promise<UploadedFile> {
-    const blob = typeof input === "string" ? await (await fetch(fetchableMediaUrl(input))).blob() : input;
+    const blob = typeof input === "string" ? await (async () => {
+        const response = await fetch(fetchableMediaUrl(input));
+        if (!response.ok) throw new Error(`媒体下载失败：HTTP ${response.status}`);
+        return response.blob();
+    })() : input;
+    if (!blob.size || /^(text\/html|application\/json)/i.test(blob.type)) throw new Error("媒体下载失败：返回内容为空或不是媒体文件");
     const storageKey = `${prefix}:${nanoid()}`;
     await store.setItem(storageKey, blob);
     const url = URL.createObjectURL(blob);

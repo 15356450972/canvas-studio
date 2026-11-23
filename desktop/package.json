@@ -1,0 +1,40 @@
+{
+    "name": "canvas-studio-desktop",
+    "productName": "Canvas Studio",
+    "version": "0.18.0",
+    "description": "Canvas Studio 桌面壳：用固定的 app://canvas-studio 地址加载前端构建产物。",
+    "private": true,
+    "type": "module",
+    "main": "main.js",
+    "scripts": {
+        "build:web": "npm --prefix ../web run build",
+        "start": "electron .",
+        "start:detached": "./run-detached.sh",
+        "dev": "npm run build:web && electron .",
+        "dev:hot": "electron . --dev",
+        "pack": "npm run build:web && electron-builder --dir",
+        "dist": "npm run build:web && electron-builder"
+    },
+    "devDependencies": {
+        "electron": "44.6.0",
+        "electron-builder": "^26.18.0"
+    },
+    "build": {
+        "appId": "studio.canvas.desktop",
+        "files": [
+            "main.js",
+            "preload.cjs",
+            "image-folder.js",
+            "build/icon.png"
+        ],
+        "extraResources": [
+            {
+                "from": "../web/dist",
+                "to": "web"
+            }
+        ],
+        "mac": {
+            "category": "public.app-category.graphics-design"
+        }
+    }
+}

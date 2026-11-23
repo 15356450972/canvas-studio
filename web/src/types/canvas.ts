@@ -50,6 +50,8 @@ export type CanvasNodeMetadata = {
     content?: string;
     composerContent?: string;
     prompt?: string;
+    shotSequence?: string;
+    sourcePrompt?: string;
     status?: CanvasNodeStatus;
     errorDetails?: string;
     fontSize?: number;

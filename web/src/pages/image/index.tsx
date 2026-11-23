@@ -8,6 +8,7 @@ import { useTranslation } from "react-i18next";
 import { ImageSettingsPanel } from "@/components/image-settings-panel";
 import { ModelPicker } from "@/components/model-picker";
 import { PromptSelectDialog } from "@/components/prompts/prompt-select-dialog";
+import { AssetBatchAddModal } from "@/components/assets/asset-batch-add-modal";
 import { AssetPickerModal, type InsertAssetPayload } from "@/components/canvas/asset-picker-modal";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { imageReferenceLabel } from "@/lib/image-reference-prompt";
@@ -67,6 +68,8 @@ type GenerationLog = {
 
 type GenerationLogConfig = Pick<AiConfig, "model" | "imageModel" | "quality" | "size" | "count">;
 
+type SavableResult = { id: string; image: GeneratedImage; title: string; prompt: string };
+
 type UpdateAiConfig = <K extends keyof AiConfig>(key: K, value: AiConfig[K]) => void;
 
 const LOG_STORE_KEY = "infinite-canvas:image_generation_logs";
@@ -94,6 +97,9 @@ export default function ImagePage() {
     const [settingsOpen, setSettingsOpen] = useState(false);
     const [promptDialogOpen, setPromptDialogOpen] = useState(false);
     const [assetPickerOpen, setAssetPickerOpen] = useState(false);
+    const [batchAddOpen, setBatchAddOpen] = useState(false);
+    // 打开弹窗时定格的结果快照：之后才生成完的图不会被悄悄算进这一批。
+    const [batchAddItems, setBatchAddItems] = useState<SavableResult[]>([]);
     const [startedAt, setStartedAt] = useState(0);
     const [elapsedMs, setElapsedMs] = useState(0);
     const [selectedLogIds, setSelectedLogIds] = useState<string[]>([]);
@@ -263,19 +269,37 @@ export default function ImagePage() {
         message.success(t("imageWorkbench.addedReference"));
     };
 
-    const saveResultToAssets = async (image: GeneratedImage, index: number, sourcePrompt: string) => {
+    const resultAssetTitle = (index: number, sourcePrompt: string) => promptAssetName(sourcePrompt) || t("imageWorkbench.resultTitle", { count: index + 1 });
+
+    const addResultAsset = async (image: GeneratedImage, title: string, sourcePrompt: string, group?: string) => {
         const stored = await uploadImage(image.dataUrl);
-        const assetName = /【([^【】]+)】/.exec(sourcePrompt)?.[1]?.trim();
         addAsset({
             kind: "image",
-            title: assetName || t("imageWorkbench.resultTitle", { count: index + 1 }),
+            title,
             coverUrl: stored.url,
             tags: [],
+            ...(group ? { group } : {}),
             source: t("imageWorkbench.source"),
             data: { dataUrl: stored.url, storageKey: stored.storageKey, width: stored.width, height: stored.height, bytes: stored.bytes, mimeType: stored.mimeType },
             metadata: { source: "image-page", prompt: sourcePrompt },
         });
+    };
+
+    const saveResultToAssets = async (image: GeneratedImage, index: number, sourcePrompt: string) => {
+        await addResultAsset(image, resultAssetTitle(index, sourcePrompt), sourcePrompt);
         message.success(t("common.addedToAssets"));
+    };
+
+    const saveResultsToAssets = async (ids: string[], group: string) => {
+        let failed = 0;
+        const picked = batchAddItems.filter((item) => ids.includes(item.id));
+        for (const item of picked) {
+            await addResultAsset(item.image, item.title, item.prompt, group).catch(() => failed++);
+        }
+        const count = picked.length - failed;
+        if (failed) message.warning(t("assets.batchAdd.partial", { count, failed }));
+        else message.success(t("assets.batchAdd.added", { count }));
+        setBatchAddOpen(false);
     };
 
     const insertPickedAsset = async (payload: InsertAssetPayload) => {
@@ -346,7 +370,7 @@ export default function ImagePage() {
             const result = snapshot.references.length ? await requestEdit(snapshot.config, snapshot.text, snapshot.references, requestOptions) : await requestGeneration(snapshot.config, snapshot.text, requestOptions);
             const image = result[0];
             if (!image) throw new Error(t("imageWorkbench.missingResult"));
-            const stored = await persistGeneratedImage(image.dataUrl);
+            const stored = await persistGeneratedImage(image.dataUrl, { name: promptAssetName(snapshot.text) });
             const nextImage: GeneratedImage = { id: image.id, dataUrl: stored.url, ...(stored.storageKey ? { storageKey: stored.storageKey } : {}), durationMs: performance.now() - itemStartedAt, width: stored.width, height: stored.height, bytes: stored.bytes, mimeType: stored.mimeType, ...(image.taskId ? { taskId: image.taskId } : {}) };
             setResults((value) => (value.some((item) => item.id === resultId) ? value.map((item) => (item.id === resultId ? { ...item, status: "success", image: nextImage, taskId: image.taskId || item.taskId } : item)) : value));
             return nextImage;
@@ -446,6 +470,9 @@ export default function ImagePage() {
     const liveResults = previewLog ? results.filter((item) => item.status === "pending") : results;
     const previewResults: GenerationResult[] = previewLog ? previewLog.images.map((image) => ({ id: image.id, status: "success", image, taskId: image.taskId, prompt: previewLog.prompt })) : [];
     const hasVisibleResults = liveResults.length > 0 || previewResults.length > 0;
+    // 标题沿用单张加入的规则，序号与卡片在各自列表中的位置一致。
+    const toSavable = (list: GenerationResult[]): SavableResult[] => list.flatMap((result, index) => (result.status === "success" && result.image ? [{ id: result.id, image: result.image, title: resultAssetTitle(index, result.prompt ?? ""), prompt: result.prompt ?? "" }] : []));
+    const savableResults = [...toSavable(liveResults), ...toSavable(previewResults)];
 
     const renderImageResult = (result: GenerationResult, index: number, canRemove: boolean) => {
         if (result.status === "success" && result.image) {
@@ -639,6 +666,18 @@ export default function ImagePage() {
                                 <h2 className="text-xl font-semibold">{t("workbench.results")}</h2>
                             </div>
                             <div className="flex items-center gap-2">
+                                {savableResults.length ? (
+                                    <Button
+                                        size="small"
+                                        icon={<FolderPlus className="size-3.5" />}
+                                        onClick={() => {
+                                            setBatchAddItems(savableResults);
+                                            setBatchAddOpen(true);
+                                        }}
+                                    >
+                                        {t("assets.batchAdd.action")}
+                                    </Button>
+                                ) : null}
                                 {!previewLog && results.some((item) => item.status !== "pending") ? (
                                     <Button size="small" danger icon={<Trash2 className="size-3.5" />} onClick={clearFinishedResults}>
                                         {t("workbench.clearResults")}
@@ -714,6 +753,7 @@ export default function ImagePage() {
             </Drawer>
             <PromptSelectDialog open={promptDialogOpen} onOpenChange={setPromptDialogOpen} onSelect={setPrompt} />
             <AssetPickerModal open={assetPickerOpen} defaultTab="my-assets" onInsert={(payload) => void insertPickedAsset(payload)} onClose={() => setAssetPickerOpen(false)} />
+            <AssetBatchAddModal open={batchAddOpen} items={batchAddItems.map((item) => ({ id: item.id, title: item.title, coverUrl: item.image.dataUrl }))} onCancel={() => setBatchAddOpen(false)} onConfirm={saveResultsToAssets} />
             <Modal title={t("workbench.deleteLogs")} open={deleteConfirmOpen} onCancel={() => setDeleteConfirmOpen(false)} onOk={deleteSelectedLogs} okText={t("common.delete")} okButtonProps={{ danger: true }} cancelText={t("common.cancel")}>
                 {t("workbench.deleteLogsConfirm", { count: selectedLogIds.length })}
             </Modal>
@@ -880,6 +920,11 @@ function ResultRemoveButton({ onRemove }: { onRemove: () => void }) {
             </button>
         </Tooltip>
     );
+}
+
+/** 提示词里 `【】` 内的内容，用作资产标题和保存到文件夹时的文件名。 */
+function promptAssetName(prompt: string) {
+    return /【([^【】]+)】/.exec(prompt)?.[1]?.trim();
 }
 
 function updateResultAt(results: GenerationResult[], index: number, next: Partial<GenerationResult>) {

@@ -1,7 +1,7 @@
 import { create } from "zustand";
-import { createJSONStorage, persist } from "zustand/middleware";
+import { persist } from "zustand/middleware";
 
-import { localForageStorage } from "@/lib/localforage-storage";
+import { createProtectedStorage } from "@/lib/localforage-storage";
 
 export type InstalledPlugin = {
     id: string;
@@ -23,23 +23,43 @@ type PluginStore = {
     remove: (id: string) => void;
 };
 
+const PLUGIN_STORE_KEY = "infinite-canvas:plugin_store";
+const pluginStorage = createProtectedStorage<PluginStore>(PLUGIN_STORE_KEY, {
+    hydrate: (value) => {
+        if (!Array.isArray(value.state.plugins)) throw new Error("插件本地数据格式错误，已阻止覆盖");
+        return value;
+    },
+});
+
 export const usePluginStore = create<PluginStore>()(
     persist(
         (set) => ({
             plugins: [],
-            upsert: (plugin) =>
+            upsert: (plugin) => {
+                pluginStorage.requireReady();
                 set((state) => {
                     const installedAt = plugin.installedAt || new Date().toISOString();
                     const exists = state.plugins.some((item) => item.id === plugin.id);
                     const next = { ...plugin, installedAt };
                     return { plugins: exists ? state.plugins.map((item) => (item.id === plugin.id ? next : item)) : [next, ...state.plugins] };
-                }),
-            setEnabled: (id, enabled) => set((state) => ({ plugins: state.plugins.map((item) => (item.id === id ? { ...item, enabled } : item)) })),
-            remove: (id) => set((state) => ({ plugins: state.plugins.filter((item) => item.id !== id) })),
+                });
+            },
+            setEnabled: (id, enabled) => {
+                pluginStorage.requireReady();
+                set((state) => ({ plugins: state.plugins.map((item) => (item.id === id ? { ...item, enabled } : item)) }));
+            },
+            remove: (id) => {
+                pluginStorage.requireReady();
+                set((state) => ({ plugins: state.plugins.filter((item) => item.id !== id) }));
+            },
         }),
         {
-            name: "infinite-canvas:plugin_store",
-            storage: createJSONStorage(() => localForageStorage),
+            name: PLUGIN_STORE_KEY,
+            storage: pluginStorage.storage,
+            onRehydrateStorage: () => {
+                pluginStorage.beginHydration();
+                return (_state, error) => pluginStorage.finishHydration(error);
+            },
         },
     ),
 );

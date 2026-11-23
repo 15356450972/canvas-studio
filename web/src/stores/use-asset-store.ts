@@ -1,9 +1,10 @@
 import { create } from "zustand";
-import { persist, type PersistStorage, type StorageValue } from "zustand/middleware";
+import { persist, type StorageValue } from "zustand/middleware";
 
 import { nanoid } from "nanoid";
-import { localForageStorage } from "@/lib/localforage-storage";
-import { cleanupUnusedImages, resolveImageUrl, uploadImage } from "@/services/image-storage";
+import { createProtectedStorage } from "@/lib/localforage-storage";
+import { reportStorageIssue, useStorageStatusStore } from "@/stores/use-storage-status-store";
+import { cleanupUnusedImages, resolveImageUrl } from "@/services/image-storage";
 import { cleanupUnusedMedia, resolveMediaUrl } from "@/services/file-storage";
 
 export type AssetKind = "text" | "image" | "video";
@@ -51,31 +52,26 @@ export function matchesAssetGroup(asset: Asset, group?: string) {
 
 const ASSET_STORE_KEY = "infinite-canvas:asset_store";
 
-const assetStorage: PersistStorage<AssetStore> = {
-    getItem: async (name) => {
-        const value = await localForageStorage.getItem(name);
-        if (!value) return null;
-        const parsed = JSON.parse(value) as StorageValue<AssetStore>;
-        parsed.state.assets = await Promise.all(
-            parsed.state.assets.map(async (asset) => {
+const assetStorage = createProtectedStorage<AssetStore>(ASSET_STORE_KEY, {
+    hydrate: async (value) => {
+        if (!Array.isArray(value.state.assets) || (value.state.groups !== undefined && !Array.isArray(value.state.groups))) throw new Error("素材本地数据格式错误，已阻止覆盖");
+        const assets = await Promise.all(
+            value.state.assets.map(async (asset) => {
+                if (!asset || typeof asset.id !== "string" || !asset.data || typeof asset.coverUrl !== "string" || (asset.kind === "text" ? typeof asset.data.content !== "string" : asset.kind === "image" ? typeof asset.data.dataUrl !== "string" : asset.kind === "video" ? typeof asset.data.url !== "string" : true)) throw new Error("素材记录损坏，已保留原始数据并阻止覆盖");
                 if (asset.kind === "video" && asset.data.storageKey) return { ...asset, data: { ...asset.data, url: await resolveMediaUrl(asset.data.storageKey, asset.data.url) } };
-                if (asset.kind !== "image") return asset;
-                if (asset.data.storageKey)
-                    return {
-                        ...asset,
-                        coverUrl: asset.coverUrl.startsWith("blob:") ? await resolveImageUrl(asset.data.storageKey, asset.coverUrl) : asset.coverUrl,
-                        data: { ...asset.data, dataUrl: await resolveImageUrl(asset.data.storageKey, asset.data.dataUrl) },
-                    };
-                if (!asset.data.dataUrl.startsWith("data:image/")) return asset;
-                const image = await uploadImage(asset.data.dataUrl);
-                return { ...asset, coverUrl: asset.coverUrl.startsWith("data:image/") ? image.url : asset.coverUrl, data: { ...asset.data, dataUrl: image.url, storageKey: image.storageKey, bytes: image.bytes, mimeType: image.mimeType } };
+                if (asset.kind !== "image" || !asset.data.storageKey) return asset;
+                return {
+                    ...asset,
+                    coverUrl: asset.coverUrl.startsWith("blob:") ? await resolveImageUrl(asset.data.storageKey, asset.coverUrl) : asset.coverUrl,
+                    data: { ...asset.data, dataUrl: await resolveImageUrl(asset.data.storageKey, asset.data.dataUrl) },
+                };
             }),
         );
-        return parsed;
+        return { ...value, state: { ...value.state, assets } };
     },
-    setItem: (name, value) => localForageStorage.setItem(name, JSON.stringify(value)),
-    removeItem: (name) => localForageStorage.removeItem(name),
-};
+});
+
+export const flushAssetStorage = () => assetStorage.flush();
 
 export const useAssetStore = create<AssetStore>()(
     persist(
@@ -84,12 +80,14 @@ export const useAssetStore = create<AssetStore>()(
             assets: [],
             groups: [],
             addGroup: (name) => {
+                assetStorage.requireReady();
                 const group = name.trim();
                 if (!group || getAssetGroups(get().groups, get().assets).includes(group)) return false;
                 set((state) => ({ groups: [...state.groups, group] }));
                 return true;
             },
             renameGroup: (name, nextName) => {
+                assetStorage.requireReady();
                 const group = nextName.trim();
                 const available = getAssetGroups(get().groups, get().assets);
                 if (!group || !available.includes(name) || (name !== group && available.includes(group))) return false;
@@ -102,6 +100,7 @@ export const useAssetStore = create<AssetStore>()(
                 return true;
             },
             removeGroup: (name) => {
+                assetStorage.requireReady();
                 const now = new Date().toISOString();
                 set((state) => ({
                     groups: state.groups.filter((group) => group !== name),
@@ -109,42 +108,61 @@ export const useAssetStore = create<AssetStore>()(
                 }));
             },
             moveAssets: (ids, name) => {
+                assetStorage.requireReady();
                 const selected = new Set(ids);
                 const group = name?.trim() || undefined;
                 const now = new Date().toISOString();
                 set((state) => ({ assets: state.assets.map((asset) => selected.has(asset.id) ? { ...asset, group, updatedAt: now } : asset) }));
             },
             addAsset: (asset) => {
+                assetStorage.requireReady();
                 const now = new Date().toISOString();
                 const id = nanoid();
                 set((state) => ({ assets: [{ ...asset, id, createdAt: now, updatedAt: now } as Asset, ...state.assets] }));
                 return id;
             },
-            updateAsset: (id, patch) =>
+            updateAsset: (id, patch) => {
+                assetStorage.requireReady();
                 set((state) => ({
                     assets: state.assets.map((asset) => (asset.id === id ? ({ ...asset, ...patch, updatedAt: new Date().toISOString() } as Asset) : asset)),
-                })),
-            removeAsset: (id) =>
-                set((state) => {
-                    const assets = state.assets.filter((asset) => asset.id !== id);
-                    get().cleanupImages({ assets });
-                    return { assets };
-                }),
-            replaceAssets: (assets) => set({ assets }),
+                }));
+            },
+            removeAsset: (id) => {
+                assetStorage.requireReady();
+                set((state) => ({ assets: state.assets.filter((asset) => asset.id !== id) }));
+                get().cleanupImages();
+            },
+            replaceAssets: (assets) => {
+                assetStorage.requireReady();
+                set({ assets });
+            },
             cleanupImages: (extra) => {
-                window.setTimeout(async () => {
-                    const { useCanvasStore } = await import("@/stores/canvas/use-canvas-store");
-                    await cleanupUnusedImages({ assets: get().assets, projects: useCanvasStore.getState().projects, extra });
-                    await cleanupUnusedMedia({ assets: get().assets, projects: useCanvasStore.getState().projects, extra });
+                assetStorage.requireReady();
+                window.setTimeout(() => {
+                    void (async () => {
+                        const { flushCanvasStorage, useCanvasStore } = await import("@/stores/canvas/use-canvas-store");
+                        const ready = () => assetStorage.isReady() && useCanvasStore.getState().hydrated && !Object.values(useStorageStatusStore.getState().issues).some((issue) => (issue.operation === "write" || issue.severity === "warning") && (issue.key === ASSET_STORE_KEY || issue.key === "infinite-canvas:canvas_store"));
+                        await Promise.all([assetStorage.flush(), flushCanvasStorage()]);
+                        if (!ready()) return;
+                        await cleanupUnusedImages({ assets: get().assets, projects: useCanvasStore.getState().projects, extra });
+                        if (!ready()) return;
+                        await cleanupUnusedMedia({ assets: get().assets, projects: useCanvasStore.getState().projects, extra });
+                    })().catch((error) => reportStorageIssue(ASSET_STORE_KEY, "write", error));
                 }, 0);
             },
         }),
         {
             name: ASSET_STORE_KEY,
-            storage: assetStorage,
+            storage: assetStorage.storage,
             partialize: (state) => ({ assets: state.assets, groups: state.groups }) as StorageValue<AssetStore>["state"],
-            onRehydrateStorage: () => () => {
-                useAssetStore.setState({ hydrated: true });
+            onRehydrateStorage: (state) => {
+                assetStorage.beginHydration();
+                if (state.hydrated) useAssetStore.setState({ hydrated: false });
+                return (_state, error) => {
+                    if (error) return assetStorage.finishHydration(error);
+                    useAssetStore.setState({ hydrated: true });
+                    assetStorage.finishHydration();
+                };
             },
         },
     ),

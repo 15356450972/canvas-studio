@@ -43,6 +43,7 @@ import { CanvasToolbar } from "@/components/canvas/canvas-toolbar";
 import { AssetPickerModal, type InsertAssetPayload } from "@/components/canvas/asset-picker-modal";
 import { ASSET_DRAG_MIME, buildInsertPayload, CanvasSidePanel } from "@/components/canvas/canvas-side-panel";
 import { CanvasZoomControls } from "@/components/canvas/canvas-zoom-controls";
+import { getCanvasToolAfterShortcut, getShouldHandleCanvasToolToggle } from "@/pages/canvas/canvas-tool-shortcut";
 import { useAgentStore } from "@/stores/use-agent-store";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 import { useAgentBridge } from "@/pages/canvas/hooks/use-agent-bridge";
@@ -1659,18 +1660,25 @@ function InfiniteCanvasPage() {
     useEffect(() => {
         const handleKeyDown = (event: KeyboardEvent) => {
             const target = event.target instanceof Element ? event.target : null;
+            const isEditableTarget =
+                event.target instanceof HTMLInputElement ||
+                event.target instanceof HTMLTextAreaElement ||
+                event.target instanceof HTMLSelectElement ||
+                !!target?.closest("[contenteditable='true']") ||
+                !!target?.isContentEditable;
+            const isShortcutIgnored = !!target?.closest("[data-canvas-shortcuts-ignore]");
+            const isToolToggleShortcut = getShouldHandleCanvasToolToggle({ key: event.key, metaKey: event.metaKey, ctrlKey: event.ctrlKey, altKey: event.altKey, isEditable: isEditableTarget, isShortcutsIgnored: isShortcutIgnored });
+            if (isToolToggleShortcut) {
+                event.preventDefault();
+                setCanvasTool((current) => getCanvasToolAfterShortcut(current));
+                return;
+            }
             // Node media (video / audio) is focusable, so clicking it makes it the keydown target.
             // It carries data-canvas-no-zoom to stop wheel zoom, but that attribute must not swallow canvas
             // shortcuts too, otherwise Delete / Backspace can never remove a selected video or audio node.
             const isNodeMedia = !!target?.closest("[data-canvas-video],[data-canvas-audio]");
-            if (
-                !isNodeMedia &&
-                (event.target instanceof HTMLInputElement ||
-                    event.target instanceof HTMLTextAreaElement ||
-                    event.target instanceof HTMLSelectElement ||
-                    target?.closest("[contenteditable='true'],[data-canvas-no-zoom],[data-canvas-shortcuts-ignore]"))
-            )
-                return;
+            const isNoZoomTarget = !!target?.closest("[data-canvas-no-zoom]");
+            if (!isNodeMedia && (isEditableTarget || isShortcutIgnored || (isNoZoomTarget && !isToolToggleShortcut))) return;
 
             const key = event.key.toLowerCase();
             const isModifierShortcut = event.metaKey || event.ctrlKey;
@@ -2602,11 +2610,15 @@ function InfiniteCanvasPage() {
                     const videoNode: CanvasNodeData = {
                         id: videoId,
                         type: CanvasNodeType.Video,
-                        title: effectivePrompt.slice(0, 32) || "Generated Video",
+                        title: isEmptyVideoNode && sourceNode.metadata?.shotSequence ? sourceNode.title : effectivePrompt.slice(0, 32) || "Generated Video",
                         position: isEmptyVideoNode ? { x: sourceNode.position.x + (sourceNode.width - previewSize.width) / 2, y: sourceNode.position.y + (sourceNode.height - previewSize.height) / 2 } : { x: parent.x + (sourceNode?.width || spec.width) + 96, y: parent.y },
                         width: previewSize.width,
                         height: previewSize.height,
                         metadata: {
+                            ...(isEmptyVideoNode ? sourceNode.metadata : {}),
+                            videoTaskId: undefined,
+                            videoTaskProvider: undefined,
+                            errorDetails: undefined,
                             prompt: effectivePrompt,
                             ...(isEmptyVideoNode ? { composerContent: prompt } : {}),
                             status: NODE_STATUS_LOADING,
@@ -2828,7 +2840,7 @@ function InfiniteCanvasPage() {
                 await pollVideoNodeTask(node);
                 return;
             }
-            const sourceNode = findRetrySourceNode(node.id, nodesRef.current, connectionsRef.current) || node;
+            const sourceNode = node.type === CanvasNodeType.Video && node.metadata?.shotSequence ? node : findRetrySourceNode(node.id, nodesRef.current, connectionsRef.current) || node;
             const savedImageMetadata = node.type === CanvasNodeType.Image ? node.metadata : undefined;
             const hasSavedImageMetadata = Boolean(savedImageMetadata?.generationType);
             const generationConfig =
@@ -3106,6 +3118,45 @@ function InfiniteCanvasPage() {
         [getViewportCenter, insertAssistantImage, insertAssistantText],
     );
 
+    const handleAssetsInsert = useCallback(
+        async (payloads: InsertAssetPayload[]) => {
+            const results = await Promise.allSettled(payloads.map(async (payload): Promise<CanvasNodeData> => {
+                const center = { x: 0, y: 0 };
+                if (payload.kind === "text") return { ...createCanvasNode(CanvasNodeType.Text, center, { content: payload.content, status: NODE_STATUS_SUCCESS }), title: payload.title };
+                if (payload.kind === "video") {
+                    const spec = NODE_DEFAULT_SIZE[CanvasNodeType.Video];
+                    return { ...createCanvasNode(CanvasNodeType.Video, center, { content: payload.url, storageKey: payload.storageKey, status: NODE_STATUS_SUCCESS, naturalWidth: payload.width, naturalHeight: payload.height }), ...videoNodeSize(payload.width || spec.width, payload.height || spec.height), title: payload.title };
+                }
+                const preview = new Image();
+                if (payload.storageKey) {
+                    preview.src = payload.dataUrl;
+                    await preview.decode();
+                }
+                const image = payload.storageKey ? { url: payload.dataUrl, storageKey: payload.storageKey, width: preview.naturalWidth, height: preview.naturalHeight, mimeType: "", bytes: 0 } : await uploadImage(payload.dataUrl);
+                return { ...createCanvasNode(CanvasNodeType.Image, center, { ...imageMetadata(image), prompt: payload.title }), ...fitNodeSize(image.width, image.height), title: payload.title };
+            }));
+            const failed = results.filter((result) => result.status === "rejected").length;
+            if (failed) throw new Error(`${failed} 项资产读取失败，未导入任何资产，请重试`);
+            const imported = results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+            if (!imported.length) return;
+            const arranged = arrangeCanvasNodes(imported, size.width / size.height);
+            const bounds = nodeBounds(arranged);
+            const center = getViewportCenter();
+            let dx = center.x - (bounds.left + bounds.right) / 2;
+            const dy = center.y - (bounds.top + bounds.bottom) / 2;
+            const current = nodesRef.current;
+            if (current.some((node) => node.position.x < bounds.right + dx && node.position.x + node.width > bounds.left + dx && node.position.y < bounds.bottom + dy && node.position.y + node.height > bounds.top + dy)) {
+                dx = nodeBounds(current).right + 64 - bounds.left;
+            }
+            const placed = arranged.map((node) => ({ ...node, position: { x: node.position.x + dx, y: node.position.y + dy } }));
+            setNodes((prev) => [...prev, ...placed]);
+            setSelectedNodeIds(new Set(placed.map((node) => node.id)));
+            setSelectedConnectionId(null);
+            setDialogNodeId(null);
+        },
+        [getViewportCenter, size.width, size.height],
+    );
+
     // Defined after handleAssetInsert so it can reuse it; it is only referenced from JSX, so the
     // later position does not affect the render order.
     const handleDrop = useCallback(
@@ -3237,7 +3288,7 @@ function InfiniteCanvasPage() {
 
     return (
         <main className="flex h-full min-h-0 overflow-hidden" style={{ background: theme.canvas.background, color: theme.node.text }}>
-            <CanvasSidePanel nodes={nodes} selectedNodeIds={selectedNodeIds} onFocusNode={focusNode} onPreviewNode={setPreviewNodeId} onInsertAsset={handleAssetInsert} />
+            <CanvasSidePanel nodes={nodes} selectedNodeIds={selectedNodeIds} onFocusNode={focusNode} onPreviewNode={setPreviewNodeId} onInsertAsset={handleAssetInsert} onInsertAssets={handleAssetsInsert} />
             <section className="relative min-w-0 flex-1 overflow-hidden">
                 <CanvasTopBar
                     title={currentProject?.title || t("canvas.projectPage.untitledCanvas")}
@@ -3552,7 +3603,7 @@ function InfiniteCanvasPage() {
                     <p className="text-sm opacity-60">{t("canvas.projectPage.clearDescription")}</p>
                 </Modal>
 
-                <AssetPickerModal open={assetPickerOpen} onInsert={handleAssetInsert} onClose={() => setAssetPickerOpen(false)} />
+                <AssetPickerModal open={assetPickerOpen} onInsert={handleAssetInsert} onInsertMany={handleAssetsInsert} onClose={() => setAssetPickerOpen(false)} />
             </section>
         </main>
     );

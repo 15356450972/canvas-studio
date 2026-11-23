@@ -7,7 +7,8 @@ import { clampVideoSeconds, computeVideoSize, inferVideoRatio } from "@/lib/medi
 import { getMediaBlob, resolveMediaUrl, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { imageToDataUrl } from "@/services/image-storage";
 import { resolvePublicHttpUrls } from "@/services/public-upload";
-import { boolConfig, buildApiUrl, isBuiltInChannel, isNewtakeRequest, modelOptionName, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
+import { NEWTAKE_MAX_AUDIOS, NEWTAKE_MAX_DURATION_SECONDS, NEWTAKE_MAX_IMAGES, boolConfig, buildApiUrl, isBuiltInChannel, isNewtakeRequest, modelOptionName, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
+import { saveGeneratedVideoToFolder, useVideoFolderStore } from "@/stores/use-video-folder-store";
 import { runModelPlugin } from "./model-plugin";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
@@ -21,7 +22,6 @@ const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiE
 
 export type VideoGenerationResult = { blob?: Blob; url?: string; mimeType?: string };
 export type VideoGenerationTask = { id: string; provider: "openai" | "gemini" | "plugin" | "newtake"; model: string };
-type NewtakeTask = { id?: string; status?: string; error?: string };
 type GeminiInlineData = { bytesBase64Encoded: string; mimeType: string };
 type GeminiVideoOperation = {
     name?: string;
@@ -91,53 +91,43 @@ export async function pollVideoGenerationTask(config: AiConfig, task: VideoGener
     }
     const requestConfig = resolveModelRequestConfig(config, task.model);
     assertVideoConfig(requestConfig, requestConfig.model);
-    if (task.provider === "newtake") return pollNewtakeVideoTask(requestConfig, task, options);
+    // Newtake also returns OpenAI video objects and uses /videos/{id}/content.
     if (task.provider === "gemini") return pollGeminiVideoTask(requestConfig, task, options);
     return pollOpenAIVideoTask(requestConfig, task, options);
 }
 
-/** Newtake 出片台：参考图/音频先传 /v1/images 换 id，再提交 /v1/tasks。 */
+/** Newtake Maker: upload references through /v1/images, then create an OpenAI-compatible /v1/videos task. */
 async function createNewtakeVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: VideoMediaOptions): Promise<VideoGenerationTask> {
+    const audios = options?.audios || [];
     if (options?.videos?.length) throw new Error(apiText("newtakeVideoRefUnsupported"));
+    if (references.length > NEWTAKE_MAX_IMAGES) throw new Error(apiText("newtakeImageLimit"));
+    if (audios.length > NEWTAKE_MAX_AUDIOS) throw new Error(apiText("newtakeAudioLimit"));
+    if (audios.length && !references.length) throw new Error(apiText("newtakeAudioNeedsImage"));
+    const rawSeconds = String(config.videoSeconds || "").trim();
+    const seconds = rawSeconds ? Number(rawSeconds) : 4;
+    if (!Number.isInteger(seconds) || seconds < 4 || seconds > NEWTAKE_MAX_DURATION_SECONDS) throw new Error(apiText("newtakeDurationInvalid"));
     try {
         const form = new FormData();
         for (const [index, image] of references.entries()) {
             const file = dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image, options) });
             form.append("files", file, newtakeFileName(file, `ref-${index + 1}`, "png"));
         }
-        for (const [index, audio] of (options?.audios || []).entries()) {
+        for (const [index, audio] of audios.entries()) {
             const file = await referenceMediaToFile(audio, "ref.mp3", "invalidReferenceAudio", options);
             form.append("audios", file, newtakeFileName(file, `audio-${index + 1}`, "mp3"));
         }
-        const uploaded = references.length || options?.audios?.length ? (await axios.post<{ images?: Array<{ id: string; kind?: string }> }>(aiApiUrl(config, "/images"), form, { headers: aiHeaders(config), signal: options?.signal })).data.images || [] : [];
-        const ratio = inferVideoRatio(config.size);
-        const body = {
-            prompt,
-            ...(ratio !== "auto" ? { aspect_ratio: ratio } : {}),
-            resolution: normalizeVideoResolution(config.vquality),
-            duration: Number(normalizeVideoSeconds(config.videoSeconds)),
-            count: 1,
-            ...(uploaded.some((item) => item.kind !== "audio") ? { image_ids: uploaded.filter((item) => item.kind !== "audio").map((item) => item.id) } : {}),
-            ...(uploaded.some((item) => item.kind === "audio") ? { audio_ids: uploaded.filter((item) => item.kind === "audio").map((item) => item.id) } : {}),
-        };
-        const id = (await axios.post<{ tasks?: NewtakeTask[] }>(aiApiUrl(config, "/tasks"), body, { headers: aiHeaders(config, "application/json"), signal: options?.signal })).data.tasks?.[0]?.id;
+        const uploaded = references.length || audios.length ? (await axios.post<{ images?: Array<{ id: string; kind?: string }> }>(aiApiUrl(config, "/images"), form, { headers: aiHeaders(config), signal: options?.signal })).data.images || [] : [];
+        const body: Record<string, unknown> = { model: modelOptionName(model), prompt, seconds };
+        const imageIds = uploaded.filter((item) => item.kind !== "audio").map((item) => item.id);
+        const audioIds = uploaded.filter((item) => item.kind === "audio").map((item) => item.id);
+        if (imageIds.length) body.image_ids = imageIds;
+        if (audioIds.length) body.audio_ids = audioIds;
+        const created = (await axios.post<VideoResponse>(aiApiUrl(config, "/videos"), body, { headers: aiHeaders(config, "application/json"), signal: options?.signal })).data;
+        const id = unwrapVideoResponse(created).id;
         if (!id) throw new Error(apiText("noVideoTaskId"));
         return { id, provider: "newtake", model };
     } catch (error) {
         throw new Error(readAxiosError(error, apiText("videoTaskCreateFailed")));
-    }
-}
-
-async function pollNewtakeVideoTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
-    try {
-        const state = (await axios.get<{ task?: NewtakeTask }>(aiApiUrl(config, `/tasks/${encodeURIComponent(task.id)}`), { headers: aiHeaders(config), signal: options?.signal })).data.task;
-        if (state?.status === "failed") return { status: "failed", error: state.error || apiText("videoGenerationFailed") };
-        if (state?.status !== "completed") return { status: "pending" };
-        const content = await axios.get<Blob>(aiApiUrl(config, `/tasks/${encodeURIComponent(task.id)}/video`), { headers: aiHeaders(config), responseType: "blob", signal: options?.signal });
-        await assertVideoBlob(content.data);
-        return { status: "completed", result: { blob: content.data } };
-    } catch (error) {
-        throw new Error(readAxiosError(error, apiText("videoTaskQueryFailed")));
     }
 }
 
@@ -198,15 +188,19 @@ function videoPluginResult(result: unknown): VideoGenerationResult {
 }
 
 export async function storeGeneratedVideo(result: VideoGenerationResult): Promise<UploadedFile> {
-    if (result.blob) return uploadMediaFile(result.blob, "video");
-    if (result.url) {
-        try {
-            return await uploadMediaFile(result.url, "video");
-        } catch {
-            return { url: result.url, storageKey: "", bytes: 0, mimeType: result.mimeType || "video/mp4" };
-        }
+    let stored: UploadedFile;
+    try {
+        if (!result.blob && !result.url) throw new Error(apiText("noPlayableVideo"));
+        stored = await uploadMediaFile(result.blob || result.url!, "video");
+    } catch (error) {
+        useVideoFolderStore.setState({ error: "视频下载失败，未保存到本地" });
+        // 保留远程预览，但明确标记没有本地副本。
+        if (result.url) return { url: result.url, storageKey: "", bytes: 0, mimeType: result.mimeType || "video/mp4" };
+        throw error;
     }
-    throw new Error(apiText("noPlayableVideo"));
+    const blob = await getMediaBlob(stored.storageKey);
+    if (blob) void saveGeneratedVideoToFolder(blob);
+    return stored;
 }
 
 async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: VideoMediaOptions): Promise<VideoGenerationTask> {

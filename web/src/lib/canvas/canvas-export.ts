@@ -71,7 +71,13 @@ export function isExportableVideoNode(node: CanvasNodeData) {
 
 export async function exportCanvasVideos(nodes: CanvasNodeData[], fileName: string) {
     const failed: string[] = [];
-    const videos = nodes.filter(isExportableVideoNode);
+    const videos = nodes.filter(isExportableVideoNode).sort((a, b) => {
+        const first = a.metadata?.shotSequence;
+        const second = b.metadata?.shotSequence;
+        if (first && second) return first.localeCompare(second, undefined, { numeric: true });
+        return first ? -1 : second ? 1 : 0;
+    });
+    const used = new Set<string>();
     const results = await Promise.all(videos.map(async (node, index) => {
         const title = node.title.trim() || i18n.t("canvas.projectPage.canvasVideo");
         try {
@@ -87,7 +93,14 @@ export async function exportCanvasVideos(nodes: CanvasNodeData[], fileName: stri
             if (!blob.size || (blob.type && !blob.type.startsWith("video/") && blob.type !== "application/octet-stream")) throw new Error(i18n.t("canvas.export.videoUnavailable"));
             const mimeType = blob.type.startsWith("video/") ? blob.type : node.metadata?.mimeType || "video/mp4";
             const ext = fileExtension(mimeType, storageKey);
-            const name = `${String(index + 1).padStart(3, "0")}-${safeFileName(title.replace(/\.(mp4|webm|mov|mkv|avi|m4v|mpeg|mpg)$/i, ""))}.${ext}`;
+            const sequence = (node.metadata?.shotSequence || String(index + 1)).padStart(3, "0");
+            const cleanTitle = title.replace(/\.(mp4|webm|mov|mkv|avi|m4v|mpeg|mpg)$/i, "");
+            const leading = /^(\d+)[\s.．、·_-]+/.exec(cleanTitle);
+            const suffix = node.metadata?.shotSequence && leading && Number(leading[1]) === Number(sequence) ? cleanTitle.slice(leading[0].length) : cleanTitle;
+            const base = safeFileName(suffix ? `${sequence}-${suffix}` : sequence);
+            let name = `${base}.${ext}`;
+            for (let duplicate = 2; used.has(name); duplicate += 1) name = `${base}-${duplicate}.${ext}`;
+            used.add(name);
             return { name, data: blob };
         } catch {
             failed.push(title);

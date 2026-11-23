@@ -1,12 +1,14 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { App, Modal, Segmented, Tooltip } from "antd";
-import { Download, Ellipsis, FolderPlus, Image as ImageIcon, Info, MessageSquare, Minus, Music2, Plus, RefreshCw, Settings2, Trash2, Ungroup, Upload, Video } from "lucide-react";
+import { Download, Ellipsis, FolderPlus, Hand, Image as ImageIcon, Info, MessageSquare, Minus, Music2, Plus, RefreshCw, Settings2, Trash2, Ungroup, Upload, Video } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { canvasThemes } from "@/lib/canvas-theme";
+import { fileExtension } from "@/lib/canvas/canvas-export";
 import { getNodeDefinition } from "@/lib/canvas/node-registry";
 import { formatBytes, getDataUrlByteSize } from "@/lib/image-utils";
 import { useCopyText } from "@/hooks/use-copy-text";
+import { canDragToDesktop, dragMediaOut, prepareDragOut } from "@/services/desktop-drag";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { canvasNodeTaskId } from "@/lib/canvas/canvas-generation-helpers";
 import { CanvasNodeType, type CanvasNodeData, type ViewportTransform } from "@/types/canvas";
@@ -48,6 +50,7 @@ type ToolbarTool = {
     label: string;
     icon: ReactNode;
     onClick: () => void;
+    onMouseDown?: (event: ReactMouseEvent) => void;
     active?: boolean;
     danger?: boolean;
 };
@@ -105,6 +108,12 @@ export function CanvasNodeHoverToolbar({
         setImageToolSettingsOpen(false);
     }, [node?.id]);
 
+    // 悬停时就把媒体读成字节：真按下拖出去时不用再等下载，拖拽会话才能跟上鼠标。
+    const prefetchUrl = node && (node.type === CanvasNodeType.Image || node.type === CanvasNodeType.Video || node.type === CanvasNodeType.Audio) ? node.metadata?.content : undefined;
+    useEffect(() => {
+        prepareDragOut(prefetchUrl);
+    }, [prefetchUrl]);
+
     if (!node) return null;
 
     const activeNode = node;
@@ -131,6 +140,20 @@ export function CanvasNodeHoverToolbar({
     };
     const imageTools = buildImageToolbarTools(node, { onUpload, onToggleFreeResize, onMaskEdit, onCrop, onSplit, onUpscale, onSuperResolve, onAngle, onViewImage, onCopyPrompt: copyImagePrompt, onReversePrompt });
 
+    // 拖出去的是真实文件，剪映和系统都按扩展名识别类型，所以名字要和媒体对得上。
+    const dragOutFileName = (target: CanvasNodeData) => {
+        const content = target.metadata?.content || "";
+        const extension = fileExtension(target.metadata?.mimeType || content, target.metadata?.storageKey || "");
+        const fallback = target.type === CanvasNodeType.Video ? "mp4" : target.type === CanvasNodeType.Audio ? "mp3" : "png";
+        return `canvas-${target.type}-${target.id}.${extension === "bin" ? fallback : extension}`;
+    };
+
+    const startDragOut = (target: CanvasNodeData) => {
+        const content = target.metadata?.content;
+        if (!content) return;
+        void dragMediaOut(content, dragOutFileName(target)).catch(() => message.error(t("canvas.nodeToolbar.dragOutFailed")));
+    };
+
     function openImageToolSettings() {
         onKeep(activeNode.id);
         setDraftImageToolIds(quickImageToolIds);
@@ -148,6 +171,23 @@ export function CanvasNodeHoverToolbar({
         ...(canRetry ? [{ id: "retry", title: t("canvas.nodeToolbar.retryTitle"), label: t("canvas.node.retry"), icon: <RefreshCw className="size-4" />, onClick: () => onRetry(node) }] : []),
         ...(hasImage || hasVideo || isText ? [{ id: "saveAsset", title: t("common.addToAssets"), label: t("canvas.nodeToolbar.saveAsset"), icon: <FolderPlus className="size-4" />, onClick: () => onSaveAsset(node) }] : []),
         ...(hasImage || hasVideo || hasAudio ? [{ id: "download", title: t(hasAudio ? "canvas.nodeToolbar.downloadAudio" : hasVideo ? "canvas.nodeToolbar.downloadVideo" : "canvas.nodeToolbar.downloadImage"), label: t("common.download"), icon: <Download className="size-4" />, onClick: () => onDownload(node) }] : []),
+        // 按住这个按钮往外拖 = 系统级文件拖拽，可以直接落到剪映、Finder 等应用里。
+        ...(canDragToDesktop() && (hasImage || hasVideo || hasAudio)
+            ? [
+                  {
+                      id: "dragOut",
+                      title: t("canvas.nodeToolbar.dragOutTitle"),
+                      label: t("canvas.nodeToolbar.dragOut"),
+                      icon: <Hand className="size-4" />,
+                      onClick: () => undefined,
+                      onMouseDown: (event: ReactMouseEvent) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          startDragOut(node);
+                      },
+                  },
+              ]
+            : []),
         ...(isVideo ? [{ id: "edit", title: t("common.edit"), label: t("common.edit"), icon: <MessageSquare className="size-4" />, onClick: () => onToggleDialog(node) }] : []),
         ...(isText ? [{ id: "generateImage", title: t("canvas.node.generateImage"), label: t("canvas.node.generate"), icon: <ImageIcon className="size-4" />, onClick: () => onGenerateImage(node) }] : []),
         ...(isConfig ? [{ id: "config", title: t("canvas.configNode.title"), label: t("canvas.configNode.title"), icon: <Settings2 className="size-4" />, onClick: () => onToggleDialog(node) }] : []),
@@ -158,7 +198,7 @@ export function CanvasNodeHoverToolbar({
         ...(isAudio ? [{ id: "uploadAudio", title: t(hasAudio ? "canvas.nodeToolbar.replaceAudio" : "canvas.nodeToolbar.uploadAudio"), label: t(hasAudio ? "canvas.nodeToolbar.replaceAudio" : "canvas.nodeToolbar.uploadAudio"), icon: <Music2 className="size-4" />, onClick: () => onUpload(node) }] : []),
         ...(hasImage ? imageTools.map((tool) => ({ id: tool.id, title: tool.title, label: tool.label, icon: tool.icon, active: tool.active, onClick: tool.onClick })) : []),
     ];
-    const toolbarTools = hasImage ? [...baseToolbarTools, ...nodeToolbarTools].filter((tool) => quickImageToolIdSet.has(tool.id as ImageQuickToolId)) : [...baseToolbarTools, ...nodeToolbarTools, ...extraTools];
+    const toolbarTools = hasImage ? [...baseToolbarTools, ...nodeToolbarTools].filter((tool) => tool.id === "dragOut" || quickImageToolIdSet.has(tool.id as ImageQuickToolId)) : [...baseToolbarTools, ...nodeToolbarTools, ...extraTools];
     const selectableImageToolbarTools = [...baseToolbarTools, ...nodeToolbarTools].filter((tool) => tool.id !== "retry") as ImageToolbarSettingsTool[];
 
     const closeImageToolSettings = () => {
@@ -288,11 +328,11 @@ export function CanvasNodeInfoModal({ node, open, onClose }: { node: CanvasNodeD
     );
 }
 
-function ToolbarAction({ title, label, icon, onClick, showLabel, active = false, danger = false }: ToolbarTool & { showLabel: boolean }) {
+function ToolbarAction({ title, label, icon, onClick, onMouseDown, showLabel, active = false, danger = false }: ToolbarTool & { showLabel: boolean }) {
     const hasText = showLabel && Boolean(label);
     return (
         <Tooltip title={title} placement="top" mouseEnterDelay={0.2} color="#ffffff" styles={{ root: { color: "#242529", boxShadow: "0 8px 24px rgba(15,23,42,.16)", fontSize: 13, fontWeight: 500 } }}>
-            <button type="button" className={`group relative flex h-12 items-center whitespace-nowrap px-1.5 ${danger ? "text-[#ef4444]" : ""}`} onClick={onClick} aria-label={title}>
+            <button type="button" className={`group relative flex h-12 items-center whitespace-nowrap px-1.5 ${danger ? "text-[#ef4444]" : ""}`} onClick={onClick} onMouseDown={onMouseDown} aria-label={title}>
                 <span className={`flex h-9 items-center ${hasText ? "gap-2 px-2.5" : "justify-center px-2"} rounded-lg transition group-hover:bg-[#f0f0f1] ${active ? "bg-[#eeeeef]" : ""}`}>
                     {icon}
                     {hasText ? <span>{label}</span> : null}
